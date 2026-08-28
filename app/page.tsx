@@ -9,6 +9,7 @@ import {
   behaviorShares,
   callContentIndex,
   candidateShare,
+  compareSessionGrowth,
   confidenceLabel,
   costCaption,
   displayCost,
@@ -25,7 +26,6 @@ import {
   sessionEntryCounts,
   sessionForest,
   sessionGrowthRate,
-  sessionIsActive,
   sessionParentPresent,
   sessionRoleLabel,
   sessionTreeRows,
@@ -763,10 +763,7 @@ export default function Home() {
         return compareDescending(left.inclusiveCost[currency], right.inclusiveCost[currency]);
       }
       if (sessionSort === 'growth') {
-        const leftActive = sessionIsActive(left);
-        const rightActive = sessionIsActive(right);
-        if (leftActive !== rightActive) return leftActive ? -1 : 1;
-        return compareDescending(sessionGrowthRate(left), sessionGrowthRate(right));
+        return compareSessionGrowth(left, right);
       }
       return compareDescending(
         left.lastDataAt ? Date.parse(left.lastDataAt) : undefined,

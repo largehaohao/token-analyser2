@@ -266,6 +266,18 @@ export function sessionGrowthRate(session: Pick<AnalysisSession, 'ownCalls' | 'l
   return tokens / (windowMs / 60_000);
 }
 
+export function compareSessionGrowth(
+  left: Pick<AnalysisSession, 'ownCalls' | 'lastDataAt'>,
+  right: Pick<AnalysisSession, 'ownCalls' | 'lastDataAt'>,
+): number {
+  const leftRate = sessionGrowthRate(left);
+  const rightRate = sessionGrowthRate(right);
+  if (leftRate === undefined && rightRate === undefined) return 0;
+  if (leftRate === undefined) return 1;
+  if (rightRate === undefined) return -1;
+  return rightRate - leftRate;
+}
+
 export function formatGrowthRate(rate: number | undefined): string {
   if (rate === undefined || !Number.isFinite(rate)) return '—';
   const amount = rate === 0 ? '0' : rate > 0 && rate < 1 ? '<1' : formatTokenCount(rate);

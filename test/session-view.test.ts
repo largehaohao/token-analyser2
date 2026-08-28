@@ -17,6 +17,7 @@ import {
   findSessionByKey,
   formatGrowthCaption,
   anomalyBelongsToSession,
+  compareSessionGrowth,
   sessionEntryCounts,
   sessionForest,
   sessionGrowthRate,
@@ -219,6 +220,29 @@ test('ended sessions keep the historical rate but are not presented as current b
   assert.equal(formatGrowthRate(rate).includes('当时'), false);
   assert.match(formatGrowthCaption(rate), /最长 15 分钟/);
   assert.equal(formatGrowthCaption(undefined), '调用不足两条或时间无效');
+});
+
+test('growth sort ranks by window rate rather than wall-clock recency', () => {
+  const now = Date.parse('2026-08-28T12:00:00.000Z');
+  const recent = {
+    lastDataAt: new Date(now - 60_000).toISOString(),
+    ownCalls: [
+      { timestamp: new Date(now - 120_000).toISOString(), usage: { inputTokens: 1, outputTokens: 0 } },
+      { timestamp: new Date(now - 60_000).toISOString(), usage: { inputTokens: 1, outputTokens: 0 } },
+    ] as AnalysisEvent[],
+  };
+  const older = {
+    lastDataAt: new Date(now - 86_400_000).toISOString(),
+    ownCalls: [
+      { timestamp: new Date(now - 86_400_000 - 60_000).toISOString(), usage: { inputTokens: 20_000, outputTokens: 0 } },
+      { timestamp: new Date(now - 86_400_000).toISOString(), usage: { inputTokens: 20_000, outputTokens: 0 } },
+    ] as AnalysisEvent[],
+  };
+  assert.equal(sessionIsActive(recent, now), true);
+  assert.equal(sessionIsActive(older, now), false);
+  assert.ok((sessionGrowthRate(older) ?? 0) > (sessionGrowthRate(recent) ?? 0));
+  assert.ok(compareSessionGrowth(older, recent) < 0);
+  assert.ok(compareSessionGrowth(recent, older) > 0);
 });
 
 test('displayCost does not present a missing rate as a billed zero', () => {

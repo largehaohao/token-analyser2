@@ -1386,6 +1386,10 @@ function cachedInputTokens(usage: Usage): number {
   return usage.inputIncludesCached ? Math.min(cached, usage.inputTokens) : cached;
 }
 
+function usageHasInconsistentCached(usage?: Usage): boolean {
+  return Boolean(usage?.inputIncludesCached && (usage.cachedInputTokens ?? 0) > usage.inputTokens);
+}
+
 /**
  * Returns the additive Token count for one usage record while respecting
  * provider semantics. Codex input snapshots can already include cached input;
@@ -1621,12 +1625,14 @@ function callIndexFor(calls: AnalysisEvent[]): CallIndex {
   const bySession = new Map<string, AnalysisEvent[]>();
   const byActor = new Map<string, AnalysisEvent[]>();
   for (const call of calls) {
-    const session = bySession.get(call.sessionId) ?? [];
+    const sessionKey = scopedSessionKey(call.provider, call.sessionId);
+    const session = bySession.get(sessionKey) ?? [];
     session.push(call);
-    bySession.set(call.sessionId, session);
-    const actor = byActor.get(call.actorId) ?? [];
+    bySession.set(sessionKey, session);
+    const actorKey = scopedSessionKey(call.provider, call.actorId);
+    const actor = byActor.get(actorKey) ?? [];
     actor.push(call);
-    byActor.set(call.actorId, actor);
+    byActor.set(actorKey, actor);
   }
   for (const bucket of [...bySession.values(), ...byActor.values()]) bucket.sort(compareEvents);
   const index = { bySession, byActor };
@@ -1655,7 +1661,10 @@ function nearestFromBucket(event: AnalysisEvent, bucket: AnalysisEvent[]): Analy
 function nearestCallId(event: AnalysisEvent, calls: AnalysisEvent[]): string | undefined {
   const index = callIndexFor(calls);
   const candidates = new Map<string, AnalysisEvent>();
-  for (const bucket of [index.bySession.get(event.sessionId), index.byActor.get(event.actorId)]) {
+  for (const bucket of [
+    index.bySession.get(scopedSessionKey(event.provider, event.sessionId)),
+    index.byActor.get(scopedSessionKey(event.provider, event.actorId)),
+  ]) {
     const nearest = bucket ? nearestFromBucket(event, bucket) : undefined;
     if (nearest) candidates.set(nearest.id, nearest);
   }
@@ -1738,13 +1747,15 @@ function detectRereads(events: AnalysisEvent[], calls: AnalysisEvent[]): Anomaly
   const phases = new Map<string, number>();
   for (const event of [...events].sort(compareEvents)) {
     if (isReadPhaseBoundary(event)) {
-      phases.set(event.actorId, (phases.get(event.actorId) ?? 0) + 1);
+      const phaseKey = scopedSessionKey(event.provider, event.actorId);
+      phases.set(phaseKey, (phases.get(phaseKey) ?? 0) + 1);
       continue;
     }
     if (event.kind !== 'tool' || !event.filePath || (event.behavior !== 'read' && !isReadTool(event.toolName))) continue;
     const content = event.contentHash ?? 'unknown-content';
     const range = event.fileRange ?? 'unknown-range';
-    const key = [event.actorId, phases.get(event.actorId) ?? 0, event.filePath, range, content].join('|');
+    const phaseKey = scopedSessionKey(event.provider, event.actorId);
+    const key = [event.provider, event.actorId, phases.get(phaseKey) ?? 0, event.filePath, range, content].join('|');
     const group = groups.get(key) ?? [];
     group.push(event);
     groups.set(key, group);
@@ -1800,7 +1811,7 @@ function detectPolls(events: AnalysisEvent[], calls: AnalysisEvent[]): Anomaly[]
   const groups = new Map<string, AnalysisEvent[]>();
   for (const event of events) {
     if (event.kind !== 'wait' || !event.pureWait || !event.target) continue;
-    const key = event.actorId + '|' + event.target;
+    const key = event.provider + '|' + event.actorId + '|' + event.target;
     const group = groups.get(key) ?? [];
     group.push(event);
     groups.set(key, group);
@@ -1826,9 +1837,10 @@ function detectPolls(events: AnalysisEvent[], calls: AnalysisEvent[]): Anomaly[]
           isMeaningfulUsage(call.usage) &&
           window.some(
             (wait) =>
-              call.id === wait.modelCallId ||
-              call.id === wait.callId ||
-              timestampDistance(call, wait) <= 1000,
+              call.provider === wait.provider &&
+              (call.id === wait.modelCallId ||
+                call.id === wait.callId ||
+                timestampDistance(call, wait) <= 1000),
           ),
       );
       if (!hasUsage) continue;
@@ -1872,6 +1884,7 @@ function detectCompactionLoops(events: AnalysisEvent[], calls: AnalysisEvent[]):
     const prior = reads.some(
       (read) =>
         read.actorId === compact.actorId &&
+        read.provider === compact.provider &&
         compareEvents(read, compact) < 0 &&
         Boolean(read.contentHash && read.filePath),
     );
@@ -1880,6 +1893,7 @@ function detectCompactionLoops(events: AnalysisEvent[], calls: AnalysisEvent[]):
       .filter(
         (read) =>
           read.actorId === compact.actorId &&
+          read.provider === compact.provider &&
           compareEvents(read, compact) > 0 &&
           timestampDistance(read, compact) <= 10 * 60 * 1000,
       )
@@ -1889,6 +1903,7 @@ function detectCompactionLoops(events: AnalysisEvent[], calls: AnalysisEvent[]):
         .filter(
           (read) =>
             read.actorId === compact.actorId &&
+            read.provider === compact.provider &&
             compareEvents(read, compact) < 0 &&
             read.filePath &&
             read.contentHash,
@@ -1908,6 +1923,7 @@ function detectCompactionLoops(events: AnalysisEvent[], calls: AnalysisEvent[]):
   const byActor = new Map<string, typeof cycles>();
   for (const cycle of cycles) {
     const key = [
+      cycle.compact.provider,
       cycle.compact.actorId,
       cycle.read.filePath ?? '',
       cycle.read.fileRange ?? 'unknown-range',
@@ -1962,7 +1978,7 @@ function detectCompactionLoops(events: AnalysisEvent[], calls: AnalysisEvent[]):
 function dedupeAnomalies(anomalies: Anomaly[]): Anomaly[] {
   const seen = new Set<string>();
   return anomalies.filter((anomaly) => {
-    const key = anomaly.type + '|' + anomaly.actorId + '|' + anomaly.callIds.join(',');
+    const key = anomaly.provider + '|' + anomaly.type + '|' + anomaly.actorId + '|' + anomaly.callIds.join(',');
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
@@ -1971,6 +1987,133 @@ function dedupeAnomalies(anomalies: Anomaly[]): Anomaly[] {
 
 function scopedSessionKey(provider: Provider, sessionId: string): string {
   return provider + '\u0000' + sessionId;
+}
+
+function childSessionKeys(session: AnalysisSession, map: Map<string, AnalysisSession>): string[] {
+  const keys: string[] = [];
+  for (const id of session.childSessionIds) {
+    const key = scopedSessionKey(session.provider, id);
+    if (map.has(key)) keys.push(key);
+  }
+  return keys;
+}
+
+/** Iterative Tarjan SCCs. Finish order is reverse topological on the condensation DAG. */
+function stronglyConnectedSessionKeys(map: Map<string, AnalysisSession>): string[][] {
+  const indices = new Map<string, number>();
+  const lowlink = new Map<string, number>();
+  const onStack = new Set<string>();
+  const stack: string[] = [];
+  const components: string[][] = [];
+  let nextIndex = 0;
+  type Frame = { key: string; childIndex: number; children: string[]; started: boolean };
+  const visit = (start: string) => {
+    const frames: Frame[] = [{ key: start, childIndex: 0, children: [], started: false }];
+    while (frames.length) {
+      const frame = frames[frames.length - 1]!;
+      if (!frame.started) {
+        frame.started = true;
+        indices.set(frame.key, nextIndex);
+        lowlink.set(frame.key, nextIndex);
+        nextIndex += 1;
+        stack.push(frame.key);
+        onStack.add(frame.key);
+        const session = map.get(frame.key);
+        frame.children = session ? childSessionKeys(session, map) : [];
+      }
+      if (frame.childIndex < frame.children.length) {
+        const child = frame.children[frame.childIndex]!;
+        frame.childIndex += 1;
+        if (!indices.has(child)) {
+          frames.push({ key: child, childIndex: 0, children: [], started: false });
+        } else if (onStack.has(child)) {
+          lowlink.set(frame.key, Math.min(lowlink.get(frame.key)!, indices.get(child)!));
+        }
+        continue;
+      }
+      if (lowlink.get(frame.key) === indices.get(frame.key)) {
+        const component: string[] = [];
+        while (true) {
+          const item = stack.pop()!;
+          onStack.delete(item);
+          component.push(item);
+          if (item === frame.key) break;
+        }
+        components.push(component);
+      }
+      frames.pop();
+      if (frames.length) {
+        const parent = frames[frames.length - 1]!;
+        lowlink.set(parent.key, Math.min(lowlink.get(parent.key)!, lowlink.get(frame.key)!));
+      }
+    }
+  };
+  for (const key of map.keys()) {
+    if (!indices.has(key)) visit(key);
+  }
+  return components;
+}
+
+function assignInclusiveTotals(map: Map<string, AnalysisSession>, rates: RateSnapshot[]): void {
+  const components = stronglyConnectedSessionKeys(map);
+  const sccOf = new Map<string, number>();
+  for (let sccId = 0; sccId < components.length; sccId += 1) {
+    for (const key of components[sccId]!) sccOf.set(key, sccId);
+  }
+  const childSccsOf = (keys: string[], sccId: number): number[] => {
+    const seen = new Set<number>();
+    const childSccs: number[] = [];
+    for (const key of keys) {
+      const session = map.get(key);
+      if (!session) continue;
+      for (const childKey of childSessionKeys(session, map)) {
+        const childScc = sccOf.get(childKey);
+        if (childScc === undefined || childScc === sccId || seen.has(childScc)) continue;
+        seen.add(childScc);
+        childSccs.push(childScc);
+      }
+    }
+    return childSccs;
+  };
+  const sccUsage: UsageSummary[] = [];
+  const sccCalls: AnalysisEvent[][] = [];
+  const sccCyclic: boolean[] = [];
+  for (let sccId = 0; sccId < components.length; sccId += 1) {
+    const members = components[sccId]!;
+    const cyclic =
+      members.length > 1 ||
+      members.some((key) => {
+        const session = map.get(key);
+        return Boolean(
+          session && childSessionKeys(session, map).some((childKey) => sccOf.get(childKey) === sccId),
+        );
+      });
+    sccCyclic[sccId] = cyclic;
+    const childSccs = childSccsOf(members, sccId);
+    sccUsage[sccId] = combineUsage(
+      ...members.map((key) => map.get(key)!.ownUsage),
+      ...childSccs.map((id) => sccUsage[id]!),
+    );
+    sccCalls[sccId] = [
+      ...members.flatMap((key) => map.get(key)!.ownCalls),
+      ...childSccs.flatMap((id) => sccCalls[id]!),
+    ];
+  }
+  for (const [key, session] of map) {
+    const sccId = sccOf.get(key)!;
+    if (sccCyclic[sccId]) session.completeness = 'partial';
+    if (!sccCyclic[sccId]) {
+      session.inclusiveUsage = sccUsage[sccId]!;
+      session.inclusiveCost = calculateCost(sccCalls[sccId]!, rates);
+      continue;
+    }
+    const childSccs = childSccsOf([key], sccId);
+    session.inclusiveUsage = combineUsage(session.ownUsage, ...childSccs.map((id) => sccUsage[id]!));
+    session.inclusiveCost = calculateCost(
+      [...session.ownCalls, ...childSccs.flatMap((id) => sccCalls[id]!)],
+      rates,
+    );
+  }
 }
 
 function createSessions(calls: AnalysisEvent[], rates: RateSnapshot[]): AnalysisSession[] {
@@ -2006,6 +2149,9 @@ function createSessions(calls: AnalysisEvent[], rates: RateSnapshot[]): Analysis
   for (const session of map.values()) {
     session.ownUsage = session.ownCalls.reduce((summary, call) => addUsage(summary, call.usage), emptyUsage());
     session.ownCost = calculateCost(session.ownCalls, rates);
+    if (session.ownCalls.some((call) => usageHasInconsistentCached(call.usage))) {
+      session.completeness = 'partial';
+    }
   }
   for (const session of map.values()) {
     const parentKey = session.parentSessionId
@@ -2019,36 +2165,7 @@ function createSessions(calls: AnalysisEvent[], rates: RateSnapshot[]): Analysis
       session.completeness = 'partial';
     }
   }
-  const visiting = new Set<string>();
-  const computed = new Set<string>();
-  const inclusiveCalls = new Map<string, AnalysisEvent[]>();
-  const computeInclusive = (session: AnalysisSession): AnalysisEvent[] => {
-    const key = scopedSessionKey(session.provider, session.id);
-    if (computed.has(key)) return inclusiveCalls.get(key) ?? session.ownCalls;
-    if (visiting.has(key)) {
-      session.completeness = 'partial';
-      return session.ownCalls;
-    }
-    visiting.add(key);
-    const children = session.childSessionIds
-      .map((id) => map.get(scopedSessionKey(session.provider, id)))
-      .filter((item): item is AnalysisSession => Boolean(item));
-    const childCalls = children.map((child) => computeInclusive(child));
-    session.inclusiveUsage = combineUsage(
-      session.ownUsage,
-      ...children.map((child) => child.inclusiveUsage),
-    );
-    const calls = [
-      ...session.ownCalls,
-      ...childCalls.flat(),
-    ];
-    session.inclusiveCost = calculateCost(calls, rates);
-    visiting.delete(key);
-    computed.add(key);
-    inclusiveCalls.set(key, calls);
-    return calls;
-  };
-  for (const session of map.values()) computeInclusive(session);
+  assignInclusiveTotals(map, rates);
   return [...map.values()].sort((left, right) => {
     if (left.parentSessionId && !right.parentSessionId) return 1;
     if (!left.parentSessionId && right.parentSessionId) return -1;
@@ -2084,6 +2201,7 @@ function hasUnknownData(events: AnalysisEvent[], errors: ParseError[]): boolean 
       (event) =>
         event.kind === 'unknown' ||
         (event.kind === 'model' && !event.usage && event.reportedCostUsd === undefined) ||
+        usageHasInconsistentCached(event.usage) ||
         (event.kind === 'tool' && event.complete === false),
     )
   );
