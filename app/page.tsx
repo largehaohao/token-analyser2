@@ -169,7 +169,7 @@ function SourceBadge({ provider }: { provider: Provider }) {
 }
 
 function ConfidenceBadge({ confidence }: { confidence: Anomaly['confidence'] }) {
-  return <span className={'confidence confidence-' + confidence}>{confidenceLabel(confidence)}置信度</span>;
+  return <span className={'confidence confidence-' + confidence}>{confidenceLabel(confidence)} 置信度</span>;
 }
 
 function AnomalyCard({
@@ -719,19 +719,24 @@ export default function Home() {
 
   useEffect(() => {
     function onKey(event: KeyboardEvent) {
-      if (event.key !== 'Escape' || event.defaultPrevented) return;
+      if (event.key !== 'Escape') return;
       if (expandedCallId) {
         setExpandedCallId(null);
+        event.preventDefault();
         return;
       }
       if (selectedAnomalyId) {
         setSelectedAnomalyId(null);
+        event.preventDefault();
         return;
       }
-      if (selectedSessionId) setSelectedSessionId(null);
+      if (selectedSessionId) {
+        setSelectedSessionId(null);
+        event.preventDefault();
+      }
     }
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
   }, [expandedCallId, selectedAnomalyId, selectedSessionId]);
 
   const visibleSessions = useMemo(() => {
