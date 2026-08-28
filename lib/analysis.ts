@@ -1,9 +1,13 @@
+import { extractContextSnapshots, type ContextSnapshot } from './context-inventory';
+
 export type Provider = 'codex' | 'claude' | 'unknown';
 
 export type EventKind =
   | 'model'
   | 'tool'
   | 'user'
+  | 'assistant'
+  | 'context'
   | 'compaction'
   | 'wait'
   | 'unknown';
@@ -25,6 +29,11 @@ export interface Usage {
   outputTokens: number;
   reasoningTokens?: number;
   inputIncludesCached?: boolean;
+  /**
+   * Some providers expose reasoning_output_tokens as a child of output_tokens.
+   * Keep the detail for display without adding it to the billable total twice.
+   */
+  outputIncludesReasoning?: boolean;
   cumulative?: boolean;
 }
 
@@ -38,9 +47,11 @@ export interface AnalysisEvent {
   sessionId: string;
   parentSessionId?: string;
   sessionTitle?: string;
+  cwd?: string;
   actorId: string;
   model?: string;
   callId?: string;
+  modelCallId?: string;
   userRequestId?: string;
   toolName?: string;
   toolInput?: string;
@@ -58,6 +69,7 @@ export interface AnalysisEvent {
   complete?: boolean;
   text?: string;
   rawType?: string;
+  contextSnapshot?: ContextSnapshot;
 }
 
 export interface ParsedJsonl {
@@ -148,12 +160,14 @@ export interface Anomaly {
   necessary?: boolean;
   mixed?: boolean;
   recommendation?: string;
+  associatedCost?: CostSummary;
 }
 
 export interface AnalysisSession {
   id: string;
   provider: Provider;
   title: string;
+  cwd?: string;
   parentSessionId?: string;
   childSessionIds: string[];
   ownCalls: AnalysisEvent[];
@@ -186,6 +200,10 @@ interface ParseOptions {
   provider?: Provider;
   sourceFile: string;
   sessionId?: string;
+  model?: string;
+  cwd?: string;
+  sessionTitle?: string;
+  lineOffset?: number;
 }
 
 type JsonRecord = Record<string, unknown>;
@@ -282,6 +300,45 @@ export const defaultRateSnapshots: RateSnapshot[] = [
     source: 'OpenAI Help Center Codex rate card · https://help.openai.com/en/articles/11481834',
     checkedDate: '2026-08-28',
     applicability: 'ChatGPT Work / Codex token-based credit pricing; plan, fast mode and long-context conditions must match',
+    kind: 'official',
+  },
+  {
+    id: 'claude-sonnet-4-2026-08',
+    provider: 'claude',
+    modelPattern: 'claude-sonnet-4',
+    inputUsdPerMillion: 3,
+    cachedInputUsdPerMillion: 0.3,
+    cacheCreationUsdPerMillion: 3.75,
+    outputUsdPerMillion: 15,
+    source: 'Anthropic API pricing · https://docs.anthropic.com/en/about-claude/pricing',
+    checkedDate: '2026-08-28',
+    applicability: 'Anthropic API list prices; Claude Code subscription or included usage may differ',
+    kind: 'official',
+  },
+  {
+    id: 'claude-opus-4-2026-08',
+    provider: 'claude',
+    modelPattern: 'claude-opus-4',
+    inputUsdPerMillion: 15,
+    cachedInputUsdPerMillion: 1.5,
+    cacheCreationUsdPerMillion: 18.75,
+    outputUsdPerMillion: 75,
+    source: 'Anthropic API pricing · https://docs.anthropic.com/en/about-claude/pricing',
+    checkedDate: '2026-08-28',
+    applicability: 'Anthropic API list prices; Claude Code subscription or included usage may differ',
+    kind: 'official',
+  },
+  {
+    id: 'claude-haiku-4-2026-08',
+    provider: 'claude',
+    modelPattern: 'claude-haiku',
+    inputUsdPerMillion: 1,
+    cachedInputUsdPerMillion: 0.1,
+    cacheCreationUsdPerMillion: 1.25,
+    outputUsdPerMillion: 5,
+    source: 'Anthropic API pricing · https://docs.anthropic.com/en/about-claude/pricing',
+    checkedDate: '2026-08-28',
+    applicability: 'Anthropic API list prices; Claude Code subscription or included usage may differ',
     kind: 'official',
   },
 ];
@@ -413,8 +470,23 @@ function textFromContent(value: unknown): string | undefined {
       .filter((item): item is string => Boolean(item));
     return parts.length ? parts.join('\n') : undefined;
   }
-  if (isRecord(value)) return stringValue(value.text, value.content, value.output);
+  if (isRecord(value)) {
+    const numericKeys = Object.keys(value)
+      .filter((key) => /^\d+$/.test(key))
+      .sort((left, right) => Number(left) - Number(right));
+    if (numericKeys.length) {
+      return textFromContent(numericKeys.map((key) => value[key]));
+    }
+    return stringValue(value.text, value.content, value.output, value.stdout, value.stderr, value.result);
+  }
   return undefined;
+}
+
+function boundedText(value: string | undefined, limit = 4000): string | undefined {
+  if (value === undefined || value.length <= limit) return value;
+  const head = Math.ceil(limit * 0.75);
+  const tail = Math.max(0, limit - head);
+  return value.slice(0, head) + '\n… [output truncated] …\n' + value.slice(-tail);
 }
 
 function usageFromRecord(value: unknown): Usage | undefined {
@@ -493,10 +565,37 @@ function extractArguments(value: unknown): JsonRecord {
       const parsed: unknown = JSON.parse(value);
       if (isRecord(parsed)) return parsed;
     } catch {
-      return {};
+      // Codex desktop stores custom_tool_call.input as the source text that
+      // was sent to the tool (for example a shell wrapper around `sed` or
+      // `rg`), rather than as a JSON argument object. Preserve a bounded
+      // prefix so classification can distinguish code from file reads while
+      // keeping the browser payload small.
+      return value.trim() ? { __raw: value.slice(0, 320) } : {};
     }
   }
   return {};
+}
+
+function rawToolInput(input: JsonRecord): string | undefined {
+  return stringValue(input.__raw, input.command, input.cmd, input.script, input.query, input.code);
+}
+
+function shellReadPath(input: JsonRecord): string | undefined {
+  const raw = rawToolInput(input);
+  if (!raw) return undefined;
+  const command = raw.replace(/\\"/g, '"').replace(/\\n/g, '\n');
+  const match = command.match(
+    /(?:^|[;&|]\s*|(?:cmd|command|script)\s*[:=]\s*["']?)(?:cat|sed|head|tail|rg|grep|awk|find|ls|wc|stat|git\s+(?:show|diff|log|status))\b[^\n]*?\s((?:\/?[.~]\/|\/?[A-Za-z]:[\\/]|\/)[^\s'"`|;)]+)/im,
+  );
+  return match?.[1];
+}
+
+function shellReadTool(input: JsonRecord): boolean {
+  const raw = rawToolInput(input);
+  if (!raw) return false;
+  return /(?:^|[;&|\s])(?:cat|sed|head|tail|rg|grep|awk|find|ls|wc|stat|git\s+(?:show|diff|log|status))\b/i.test(
+    raw.replace(/\\"/g, '"'),
+  );
 }
 
 function toolDetails(
@@ -511,6 +610,7 @@ function toolDetails(
     input.path,
     input.filename,
     input.file,
+    shellReadPath(input),
   );
   const start = numberValue(input.start_line, input.startLine, input.line_start, input.lineStart);
   const end = numberValue(input.end_line, input.endLine, input.line_end, input.lineEnd);
@@ -522,16 +622,18 @@ function toolDetails(
   );
   const target = stringValue(input.target, input.task_id, input.taskId, input.session_id, input.sessionId);
   const isWait =
-    /(^|[-_ ])(wait|poll|status|pending|result)([-_ ]|$)/.test(lower) ||
-    lower.includes('get_task') ||
+    /(^|[-_ ])(wait|poll)([-_ ]|$)/.test(lower) ||
+    lower.includes('wait_for') ||
+    lower.includes('get_task_status') ||
     lower.includes('check_task');
+  const nested = Boolean(output && /"type"\s*:\s*"(function_call|tool_use)"/.test(output));
   return {
     filePath,
     fileRange: range,
     target,
     stateHash: output ? hashText(output.replace(/\s+/g, ' ').trim()) : undefined,
     contentHash: output ? hashText(output) : undefined,
-    pureWait: isWait,
+    pureWait: Boolean(isWait && output && !nested),
   };
 }
 
@@ -578,14 +680,24 @@ function findParentSessionId(record: JsonRecord): string | undefined {
   return stringValue(
     record.parent_session_id,
     record.parentSessionId,
+    record.parentUuid,
+    record.parent_uuid,
     record.parent_id,
     record.parentId,
+    record.parent_thread_id,
+    record.parentThreadId,
     record.forked_from,
     record.forkedFrom,
     payload.parent_session_id,
     payload.parentSessionId,
+    payload.parentUuid,
+    payload.parent_uuid,
     payload.parent_id,
     payload.parentId,
+    payload.parent_thread_id,
+    payload.parentThreadId,
+    payload.forked_from,
+    payload.forkedFrom,
   );
 }
 
@@ -610,16 +722,34 @@ function findSessionTitle(record: JsonRecord): string | undefined {
     record.session_title,
     record.sessionTitle,
     record.title,
+    record.thread_name,
+    record.customTitle,
     payload.session_title,
     payload.sessionTitle,
     payload.title,
+    payload.thread_name,
+    payload.agent_nickname,
   );
 }
 
 function findModel(record: JsonRecord): string | undefined {
   const message = nestedRecord(record, 'message');
   const payload = payloadOf(record);
-  return stringValue(record.model, message?.model, payload.model, payload.model_name, payload.modelName);
+  const threadSettings = nestedRecord(payload, 'thread_settings');
+  const baseInstructions = nestedRecord(payload, 'base_instructions');
+  const provenance = nestedRecord(baseInstructions, 'provenance');
+  const settings = nestedRecord(payload, 'settings');
+  return stringValue(
+    record.model,
+    message?.model,
+    payload.model,
+    payload.model_name,
+    payload.modelName,
+    threadSettings?.model,
+    settings?.model,
+    baseInstructions?.model,
+    provenance?.model,
+  );
 }
 
 function findTimestamp(record: JsonRecord): string {
@@ -634,11 +764,28 @@ function findText(record: JsonRecord): string | undefined {
     record.text ??
       record.content ??
       record.output ??
-      record.message ??
       message?.content ??
+      record.message ??
+      payload.text ??
       payload.message ??
       payload.content,
   );
+}
+
+function tokenSnapshotUsage(record: JsonRecord): { usage?: Usage; cumulative: boolean } {
+  const payload = payloadOf(record);
+  const info = nestedRecord(payload, 'info') ?? nestedRecord(record, 'info');
+  const total = info ? usageFromRecord(info.total_token_usage ?? info.totalTokenUsage) : undefined;
+  if (total) {
+    total.outputIncludesReasoning = true;
+    return { usage: total, cumulative: true };
+  }
+  const last = info ? usageFromRecord(info.last_token_usage ?? info.lastTokenUsage) : undefined;
+  if (last) {
+    last.outputIncludesReasoning = true;
+    return { usage: last, cumulative: false };
+  }
+  return { usage: findUsage(record), cumulative: true };
 }
 
 function makeEvent(
@@ -646,6 +793,25 @@ function makeEvent(
   fields: Partial<AnalysisEvent>,
 ): AnalysisEvent {
   return { ...base, kind: 'unknown', ...fields };
+}
+
+function isToolResultOnly(record: JsonRecord): boolean {
+  const containers = [record, payloadOf(record), nestedRecord(record, 'message')];
+  for (const container of containers) {
+    if (!container) continue;
+    const content = container.content;
+    if (!Array.isArray(content) || content.length === 0) continue;
+    if (
+      content.every(
+        (item) =>
+          isRecord(item) &&
+          /^(tool_result|function_call_output)$/.test(stringValue(item.type)?.toLowerCase() ?? ''),
+      )
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export function parseJsonl(text: string, options: ParseOptions): ParsedJsonl {
@@ -660,6 +826,14 @@ export function parseJsonl(text: string, options: ParseOptions): ParsedJsonl {
   const toolEvents = new Map<string, AnalysisEvent>();
   const pendingOutputs = new Map<string, string>();
   const sessionTitles = new Map<string, string>();
+  const sessionDirectories = new Map<string, string>();
+  if (options.sessionId && options.cwd) sessionDirectories.set(options.sessionId, options.cwd);
+  if (options.sessionId && options.sessionTitle) sessionTitles.set(options.sessionId, options.sessionTitle);
+  const sessionParents = new Map<string, string>();
+  const sessionModels = new Map<string, string>();
+  if (options.sessionId && options.model) sessionModels.set(options.sessionId, options.model);
+  const hasTrailingNewline = /\r?\n$/.test(text);
+  const lineOffset = options.lineOffset ?? 0;
 
   const lines = text.split(/\r?\n/);
   for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
@@ -671,9 +845,11 @@ export function parseJsonl(text: string, options: ParseOptions): ParsedJsonl {
       if (!isRecord(parsed)) throw new Error('JSON 顶层不是对象');
       record = parsed;
     } catch (error) {
+      const pendingTail = lineIndex === lines.length - 1 && !hasTrailingNewline;
+      if (pendingTail) continue;
       errors.push({
         sourceFile,
-        line: lineIndex + 1,
+        line: lineIndex + 1 + lineOffset,
         message: error instanceof Error ? error.message : '无法解析 JSON',
       });
       continue;
@@ -681,27 +857,39 @@ export function parseJsonl(text: string, options: ParseOptions): ParsedJsonl {
 
     const type = recordType(record);
     provider = options.provider ?? (provider === 'unknown' ? normalizeProvider(record, sourceFile) : provider);
-    const sessionId = findSessionId(record, latestSession);
+    const sessionId = options.sessionId ?? findSessionId(record, latestSession);
     latestSession = sessionId;
     const parentSessionId = findParentSessionId(record);
     const actorId = findActorId(record, sessionId);
     const timestamp = findTimestamp(record);
     const sourceTitle = findSessionTitle(record);
+    const sourceCwd = stringValue(record.cwd, payloadOf(record).cwd);
+    if (sourceCwd) sessionDirectories.set(sessionId, sourceCwd);
+    const discoveredModel = findModel(record);
+    if (discoveredModel) sessionModels.set(sessionId, discoveredModel);
+    const model = discoveredModel ?? sessionModels.get(sessionId);
     if (sourceTitle) sessionTitles.set(sessionId, sourceTitle);
+    if (parentSessionId) sessionParents.set(sessionId, parentSessionId);
+    const resolvedParent = parentSessionId ?? sessionParents.get(sessionId);
     const base = {
       provider,
       sourceFile,
-      sourceLine: lineIndex + 1,
+      sourceLine: lineIndex + 1 + lineOffset,
       timestamp,
       sessionId,
-      parentSessionId,
+      parentSessionId: resolvedParent,
       actorId,
       sessionTitle: sourceTitle ?? sessionTitles.get(sessionId),
+      cwd: sourceCwd ?? sessionDirectories.get(sessionId),
     };
     const payload = payloadOf(record);
     const message = nestedRecord(record, 'message');
+    for (const [index, contextSnapshot] of extractContextSnapshots(record).entries()) {
+      events.push(makeEvent({ id: sourceFile + ':context:' + String(lineIndex + 1 + lineOffset) + ':' + index, ...base }, {
+        kind: 'context', contextSnapshot, rawType: type,
+      }));
+    }
     const payloadMessage = nestedRecord(payload, 'message');
-    const model = findModel(record);
     const callId = stringValue(
       record.call_id,
       record.callId,
@@ -718,12 +906,13 @@ export function parseJsonl(text: string, options: ParseOptions): ParsedJsonl {
       type.includes('user_message') ||
       type.includes('user_prompt') ||
       stringValue(message?.role, payload.role)?.toLowerCase() === 'user';
-    if (explicitUser) {
-      latestUserRequest = callId ?? sourceFile + ':request:' + String(lineIndex + 1);
+    const toolResultOnly = explicitUser && isToolResultOnly(record);
+    if (explicitUser && !toolResultOnly) {
+      latestUserRequest = callId ?? sourceFile + ':request:' + String(lineIndex + 1 + lineOffset);
       events.push(
         makeEvent(
           {
-            id: sourceFile + ':user:' + String(lineIndex + 1),
+            id: sourceFile + ':user:' + String(lineIndex + 1 + lineOffset),
             ...base,
           },
           {
@@ -736,6 +925,16 @@ export function parseJsonl(text: string, options: ParseOptions): ParsedJsonl {
       );
     }
 
+    // Keep visible replies as content evidence, not as extra billable calls.
+    const assistantText = (type === 'assistant' || type === 'agent_message' ||
+      stringValue(record.role, message?.role, payload.role)?.toLowerCase() === 'assistant')
+      ? boundedText(findText(record), 1200) : undefined;
+    if (assistantText) {
+      events.push(makeEvent({ id: sourceFile + ':assistant:' + String(lineIndex + 1 + lineOffset), ...base }, {
+        kind: 'assistant', text: assistantText, userRequestId: latestUserRequest, rawType: type,
+      }));
+    }
+
     const compact =
       type.includes('compact') ||
       type.includes('compaction') ||
@@ -745,7 +944,7 @@ export function parseJsonl(text: string, options: ParseOptions): ParsedJsonl {
       events.push(
         makeEvent(
           {
-            id: sourceFile + ':compaction:' + String(lineIndex + 1),
+            id: sourceFile + ':compaction:' + String(lineIndex + 1 + lineOffset),
             ...base,
           },
           {
@@ -763,7 +962,9 @@ export function parseJsonl(text: string, options: ParseOptions): ParsedJsonl {
       type.includes('output') ||
       type.includes('tool_result') ||
       type.includes('function_call_output');
-    const output = stringValue(record.output, payload.output, payload.result, record.result, findText(record));
+    const output = boundedText(textFromContent(
+      record.output ?? payload.output ?? payload.result ?? record.result ?? findText(record),
+    ), 512);
     const outputCallId = stringValue(
       record.tool_use_id,
       record.toolUseId,
@@ -778,10 +979,12 @@ export function parseJsonl(text: string, options: ParseOptions): ParsedJsonl {
       pendingOutputs.set(outputCallId, output);
       const existing = toolEvents.get(outputCallId);
       if (existing) {
+        const nested = /"type"\s*:\s*"(function_call|tool_use)"/.test(output);
         existing.toolOutput = output;
         existing.contentHash = hashText(output);
         existing.stateHash = hashText(output.replace(/\s+/g, ' ').trim());
         existing.complete = !record.partial && !payload.partial;
+        if (existing.kind === 'wait') existing.pureWait = !nested;
       }
     }
 
@@ -808,7 +1011,7 @@ export function parseJsonl(text: string, options: ParseOptions): ParsedJsonl {
           }
           if (itemType === 'tool_result' || itemType === 'function_call_output') {
             const itemId = stringValue(item.tool_use_id, item.toolUseId, item.call_id, item.callId);
-            const itemOutput = textFromContent(item.content ?? item.output);
+            const itemOutput = boundedText(textFromContent(item.content ?? item.output), 512);
             if (itemId && itemOutput) pendingOutputs.set(itemId, itemOutput);
           }
         }
@@ -836,46 +1039,49 @@ export function parseJsonl(text: string, options: ParseOptions): ParsedJsonl {
         toolUse,
       ]),
     ).values()];
+    const toolsThisLine: AnalysisEvent[] = [];
     for (const toolUse of uniqueToolUses) {
       const detail = toolDetails(toolUse.name, toolUse.input);
       const knownOutput = toolUse.id ? pendingOutputs.get(toolUse.id) : undefined;
       const enriched = knownOutput ? toolDetails(toolUse.name, toolUse.input, knownOutput) : detail;
       const lowerName = (toolUse.name ?? '').toLowerCase();
-      const isWait = Boolean(enriched.pureWait);
-      const eventId = sourceFile + ':tool:' + String(lineIndex + 1) + ':' + (toolUse.id ?? lowerName);
+      const waiting = isWaitTool(toolUse.name);
+      const eventId = sourceFile + ':tool:' + String(lineIndex + 1 + lineOffset) + ':' + (toolUse.id ?? lowerName);
       const toolEvent = makeEvent(
         {
           id: eventId,
           ...base,
         },
         {
-          kind: isWait ? 'wait' : 'tool',
+          kind: waiting ? 'wait' : 'tool',
           callId: toolUse.id,
           userRequestId: latestUserRequest,
           toolName: toolUse.name ?? 'unknown',
-          toolInput: JSON.stringify(toolUse.input),
-          toolOutput: knownOutput,
+          toolInput: boundedText(rawToolInput(toolUse.input) ?? JSON.stringify(toolUse.input), 320),
+          toolOutput: boundedText(knownOutput, 256),
           ...enriched,
-          behavior: isWait ? 'wait' : isReadTool(toolUse.name) ? 'read' : classifyTool(toolUse.name),
+          behavior: waiting ? 'wait' : isReadTool(toolUse.name, toolUse.input) ? 'read' : classifyTool(toolUse.name, toolUse.input),
           rawType: type,
           complete: knownOutput !== undefined,
         },
       );
       events.push(toolEvent);
+      toolsThisLine.push(toolEvent);
       if (toolUse.id) toolEvents.set(toolUse.id, toolEvent);
     }
 
-    const usage = findUsage(record);
     const isTokenSnapshot =
       type.includes('token_count') ||
       type.includes('token-count') ||
       type.includes('usage_snapshot') ||
       type.includes('usage-snapshot');
+    const snapshot = isTokenSnapshot ? tokenSnapshotUsage(record) : { usage: findUsage(record), cumulative: false };
+    const usage = snapshot.usage;
     const isResultSummary = type === 'result' || type === 'final_result';
     if (usage && !(isResultSummary && seenUsageSessions.has(provider + ':' + sessionId))) {
-      if (isTokenSnapshot) usage.cumulative = true;
+      if (isTokenSnapshot) usage.cumulative = snapshot.cumulative;
       usage.inputIncludesCached = provider === 'codex';
-      const usageId = callId ?? sourceFile + ':model:' + String(lineIndex + 1);
+      const usageId = callId ?? sourceFile + ':model:' + String(lineIndex + 1 + lineOffset);
       events.push(
         makeEvent(
           {
@@ -888,12 +1094,14 @@ export function parseJsonl(text: string, options: ParseOptions): ParsedJsonl {
             userRequestId: latestUserRequest,
             model,
             usage,
+            text: assistantText,
             scope: isTokenSnapshot ? 'tree' : 'call',
             behavior: classifyModelBehavior(toolUses),
             rawType: type,
           },
         ),
       );
+      for (const toolEvent of toolsThisLine) toolEvent.modelCallId = usageId;
       seenUsageSessions.add(provider + ':' + sessionId);
     }
 
@@ -903,12 +1111,12 @@ export function parseJsonl(text: string, options: ParseOptions): ParsedJsonl {
         events.push(
           makeEvent(
             {
-              id: sourceFile + ':summary:' + String(lineIndex + 1),
+              id: sourceFile + ':summary:' + String(lineIndex + 1 + lineOffset),
               ...base,
             },
             {
               kind: 'model',
-              callId: sourceFile + ':summary:' + String(lineIndex + 1),
+              callId: sourceFile + ':summary:' + String(lineIndex + 1 + lineOffset),
               userRequestId: latestUserRequest,
               model,
               reportedCostUsd: reportedCost,
@@ -924,13 +1132,18 @@ export function parseJsonl(text: string, options: ParseOptions): ParsedJsonl {
 
   for (const event of events) {
     if (!event.sessionTitle) event.sessionTitle = sessionTitles.get(event.sessionId);
+    if (!event.cwd) event.cwd = sessionDirectories.get(event.sessionId);
+    if (!event.parentSessionId) event.parentSessionId = sessionParents.get(event.sessionId);
+    if (!event.model) event.model = sessionModels.get(event.sessionId);
     if (!event.callId) continue;
     const output = pendingOutputs.get(event.callId);
-    if (output && event.kind === 'tool') {
+    if (output && (event.kind === 'tool' || event.kind === 'wait')) {
+      const nested = /"type"\s*:\s*"(function_call|tool_use)"/.test(output);
       event.toolOutput = output;
       event.contentHash = hashText(output);
       event.stateHash = hashText(output.replace(/\s+/g, ' ').trim());
       event.complete = true;
+      if (event.kind === 'wait') event.pureWait = !nested;
     }
   }
   events.sort(compareEvents);
@@ -952,7 +1165,17 @@ function compareEvents(left: AnalysisEvent, right: AnalysisEvent): number {
   return left.sourceLine - right.sourceLine;
 }
 
-function isReadTool(name?: string): boolean {
+function isWaitTool(name?: string): boolean {
+  const value = (name ?? '').toLowerCase();
+  return (
+    /(^|[-_ ])(wait|poll)([-_ ]|$)/.test(value) ||
+    value.includes('wait_for') ||
+    value.includes('get_task_status') ||
+    value.includes('check_task')
+  );
+}
+
+function isReadTool(name?: string, input?: JsonRecord): boolean {
   const value = (name ?? '').toLowerCase();
   return (
     value === 'read' ||
@@ -963,28 +1186,41 @@ function isReadTool(name?: string): boolean {
     value === 'head' ||
     value === 'tail' ||
     value === 'rg' ||
-    value === 'grep'
+    value === 'grep' ||
+    (value === 'exec' && Boolean(input && shellReadTool(input)))
   );
 }
 
-function classifyTool(name?: string): Behavior {
+function classifyTool(name?: string, input?: JsonRecord): Behavior {
   const value = (name ?? '').toLowerCase();
-  if (isReadTool(value)) return 'read';
+  if (isReadTool(value, input)) return 'read';
+  if (
+    value === 'task' ||
+    value === 'task_agent' ||
+    /agent|spawn|fork|delegate|collab|subagent/.test(value)
+  ) {
+    return 'subagent';
+  }
   if (/write|edit|patch|exec|shell|command|bash|terminal|apply/.test(value)) return 'code';
-  if (/agent|spawn|fork|delegate|collab|subagent/.test(value)) return 'subagent';
   if (/plan|think|reason/.test(value)) return 'planning';
-  if (/wait|poll|status|result|task/.test(value)) return 'wait';
+  if (isWaitTool(value)) return 'wait';
   return 'other';
 }
 
 function classifyModelBehavior(
-  tools: Array<{ id?: string; name?: string; input: JsonRecord }>,
+  tools: Array<{ id?: string; name?: string; input: JsonRecord; behavior?: Behavior }>,
 ): Behavior {
-  const behaviors = new Set(tools.map((item) => classifyTool(item.name)));
+  const behaviors = new Set(
+    tools.map((item) =>
+      item.behavior && item.behavior !== 'unknown'
+        ? item.behavior
+        : classifyTool(item.name, item.input),
+    ),
+  );
   behaviors.delete('other');
   if (behaviors.size === 1) return [...behaviors][0];
   if (behaviors.size > 1) return 'mixed';
-  return 'planning';
+  return 'unknown';
 }
 
 function isMeaningfulUsage(usage?: Usage): boolean {
@@ -1019,6 +1255,7 @@ function subtractUsage(current: Usage, previous: Usage): Usage {
     outputTokens: delta[3],
     reasoningTokens: delta[4],
     inputIncludesCached: current.inputIncludesCached,
+    outputIncludesReasoning: current.outputIncludesReasoning,
   };
 }
 
@@ -1071,6 +1308,7 @@ function eventFingerprint(event: AnalysisEvent): string {
     event.target ?? '',
     event.stateHash ?? '',
     event.text ?? '',
+    event.contextSnapshot ? event.contextSnapshot.category + ':' + event.contextSnapshot.fingerprint : '',
   ].join('|');
 }
 
@@ -1150,7 +1388,8 @@ export function usageTokenCount(usage?: Usage): number {
   const cached = usage.cachedInputTokens ?? 0;
   const cacheCreation = usage.cacheCreationInputTokens ?? 0;
   const input = usage.inputIncludesCached ? usage.inputTokens : usage.inputTokens + cached;
-  return input + cacheCreation + usage.outputTokens + (usage.reasoningTokens ?? 0);
+  const reasoning = usage.outputIncludesReasoning ? 0 : (usage.reasoningTokens ?? 0);
+  return input + cacheCreation + usage.outputTokens + reasoning;
 }
 
 function addUsage(target: UsageSummary, usage?: Usage): UsageSummary {
@@ -1181,15 +1420,23 @@ function combineUsage(...summaries: UsageSummary[]): UsageSummary {
 }
 
 function matchRate(call: AnalysisEvent, rates: RateSnapshot[]): RateSnapshot | undefined {
-  const model = call.model ?? '';
-  const matches = rates.filter((rate) => {
-    if (rate.provider !== call.provider && rate.provider !== 'unknown') return false;
-    const pattern = rate.modelPattern.toLowerCase();
-    const value = model.toLowerCase();
-    if (pattern === '*') return true;
-    if (pattern.endsWith('*')) return value.startsWith(pattern.slice(0, -1));
-    return value === pattern;
-  });
+  const model = (call.model ?? '').toLowerCase();
+  const scored = rates
+    .map((rate) => {
+      if (rate.provider !== call.provider && rate.provider !== 'unknown') return { rate, score: 0 };
+      const pattern = rate.modelPattern.toLowerCase();
+      let score = 0;
+      if (pattern === '*') score = 1;
+      else if (model === pattern) score = pattern.length + 100;
+      else if (pattern.endsWith('*') && model.startsWith(pattern.slice(0, -1))) {
+        score = pattern.length + 50;
+      } else if (model.startsWith(pattern)) score = pattern.length + 40;
+      else if (model.includes(pattern)) score = pattern.length + 10;
+      return { rate, score };
+    })
+    .filter((item) => item.score > 0)
+    .sort((left, right) => right.score - left.score);
+  const matches = scored.map((item) => item.rate);
   if (!matches.length) return undefined;
   // A custom snapshot may only define USD or credits. Fill its missing unit
   // from a later official/demo match without overriding the user's values.
@@ -1251,7 +1498,7 @@ function calculateCost(
     breakdown.inputTokens += usage.inputTokens;
     breakdown.cachedInputTokens += cached;
     breakdown.cacheCreationInputTokens += cacheCreation;
-    breakdown.outputTokens += usage.outputTokens + (usage.reasoningTokens ?? 0);
+    breakdown.outputTokens += usage.outputTokens + (usage.outputIncludesReasoning ? 0 : (usage.reasoningTokens ?? 0));
     const rate = matchRate(call, rates);
     if (!rate) {
       unknownCalls += 1;
@@ -1271,7 +1518,7 @@ function calculateCost(
       billableInput * (rate.inputUsdPerMillion ?? 0) / MILLION +
       cached * (rate.cachedInputUsdPerMillion ?? 0) / MILLION +
       cacheCreation * (rate.cacheCreationUsdPerMillion ?? rate.cachedInputUsdPerMillion ?? 0) / MILLION;
-    const output = usage.outputTokens + (usage.reasoningTokens ?? 0);
+    const output = usage.outputTokens + (usage.outputIncludesReasoning ? 0 : (usage.reasoningTokens ?? 0));
     const creditOutput = output * (rate.outputCreditsPerMillion ?? 0) / MILLION;
     const usdOutput = output * (rate.outputUsdPerMillion ?? 0) / MILLION;
     const creditCallKnown = !(
@@ -1347,27 +1594,96 @@ function calculateCost(
   };
 }
 
-function nearestCallId(event: AnalysisEvent, calls: AnalysisEvent[]): string | undefined {
-  const eventTime = Date.parse(event.timestamp);
-  const candidates = calls.filter((call) => call.sessionId === event.sessionId || call.actorId === event.actorId);
-  let nearest: AnalysisEvent | undefined;
-  let distance = Number.POSITIVE_INFINITY;
-  for (const call of candidates) {
-    const callTime = Date.parse(call.timestamp);
-    const value =
-      Number.isFinite(eventTime) && Number.isFinite(callTime)
-        ? Math.abs(callTime - eventTime)
-        : Math.abs(call.sourceLine - event.sourceLine);
-    if (value < distance) {
-      nearest = call;
-      distance = value;
-    }
+interface CallIndex {
+  bySession: Map<string, AnalysisEvent[]>;
+  byActor: Map<string, AnalysisEvent[]>;
+}
+
+const callIndexCache = new WeakMap<AnalysisEvent[], CallIndex>();
+
+function callIndexFor(calls: AnalysisEvent[]): CallIndex {
+  const cached = callIndexCache.get(calls);
+  if (cached) return cached;
+  const bySession = new Map<string, AnalysisEvent[]>();
+  const byActor = new Map<string, AnalysisEvent[]>();
+  for (const call of calls) {
+    const session = bySession.get(call.sessionId) ?? [];
+    session.push(call);
+    bySession.set(call.sessionId, session);
+    const actor = byActor.get(call.actorId) ?? [];
+    actor.push(call);
+    byActor.set(call.actorId, actor);
   }
-  return nearest?.id;
+  for (const bucket of [...bySession.values(), ...byActor.values()]) bucket.sort(compareEvents);
+  const index = { bySession, byActor };
+  callIndexCache.set(calls, index);
+  return index;
+}
+
+function nearestFromBucket(event: AnalysisEvent, bucket: AnalysisEvent[]): AnalysisEvent | undefined {
+  if (!bucket.length) return undefined;
+  let low = 0;
+  let high = bucket.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (compareEvents(bucket[middle], event) < 0) low = middle + 1;
+    else high = middle;
+  }
+  const candidates = [bucket[low - 1], bucket[low]].filter(
+    (item): item is AnalysisEvent => Boolean(item),
+  );
+  return candidates.reduce<AnalysisEvent | undefined>((nearest, candidate) => {
+    if (!nearest || timestampDistance(candidate, event) < timestampDistance(nearest, event)) return candidate;
+    return nearest;
+  }, undefined);
+}
+
+function nearestCallId(event: AnalysisEvent, calls: AnalysisEvent[]): string | undefined {
+  const index = callIndexFor(calls);
+  const candidates = new Map<string, AnalysisEvent>();
+  for (const bucket of [index.bySession.get(event.sessionId), index.byActor.get(event.actorId)]) {
+    const nearest = bucket ? nearestFromBucket(event, bucket) : undefined;
+    if (nearest) candidates.set(nearest.id, nearest);
+  }
+  return [...candidates.values()].reduce<AnalysisEvent | undefined>((nearest, candidate) => {
+    if (!nearest || timestampDistance(candidate, event) < timestampDistance(nearest, event)) return candidate;
+    return nearest;
+  }, undefined)?.id;
 }
 
 function eventCallId(event: AnalysisEvent, calls: AnalysisEvent[]): string | undefined {
-  return event.callId ?? nearestCallId(event, calls);
+  if (event.kind === 'model') return event.id;
+  return event.modelCallId ?? nearestCallId(event, calls);
+}
+
+function assignModelCallIds(events: AnalysisEvent[]): void {
+  const calls = events.filter((event) => event.kind === 'model' && event.scope !== 'summary');
+  for (const event of events) {
+    if (event.kind === 'model' || event.modelCallId) continue;
+    if (event.kind === 'tool' || event.kind === 'wait' || event.kind === 'compaction') {
+      event.modelCallId = nearestCallId(event, calls);
+    }
+  }
+  const toolsByCall = new Map<string, AnalysisEvent[]>();
+  for (const event of events) {
+    if (!event.modelCallId || (event.kind !== 'tool' && event.kind !== 'wait')) continue;
+    const group = toolsByCall.get(event.modelCallId) ?? [];
+    group.push(event);
+    toolsByCall.set(event.modelCallId, group);
+  }
+  for (const call of calls) {
+    const tools = toolsByCall.get(call.id);
+    if (!tools?.length) continue;
+    if (call.behavior && call.behavior !== 'unknown') continue;
+    call.behavior = classifyModelBehavior(
+      tools.map((item) => ({
+        id: item.callId,
+        name: item.toolName,
+        input: extractArguments(item.toolInput),
+        behavior: item.behavior,
+      })),
+    );
+  }
 }
 
 function evidenceForEvent(event: AnalysisEvent, label: string, detail: string): Evidence {
@@ -1493,7 +1809,12 @@ function detectPolls(events: AnalysisEvent[], calls: AnalysisEvent[]): Anomaly[]
         (call) =>
           call.usage &&
           isMeaningfulUsage(call.usage) &&
-          window.some((wait) => call.id === wait.callId || timestampDistance(call, wait) <= 1000),
+          window.some(
+            (wait) =>
+              call.id === wait.modelCallId ||
+              call.id === wait.callId ||
+              timestampDistance(call, wait) <= 1000,
+          ),
       );
       if (!hasUsage) continue;
       const first = window[0];
@@ -1532,6 +1853,13 @@ function detectCompactionLoops(events: AnalysisEvent[], calls: AnalysisEvent[]):
   const reads = readEvents(events);
   const cycles: Array<{ compact: AnalysisEvent; read: AnalysisEvent }> = [];
   for (const compact of compactions) {
+    const prior = reads.some(
+      (read) =>
+        read.actorId === compact.actorId &&
+        compareEvents(read, compact) < 0 &&
+        Boolean(read.contentHash && read.filePath),
+    );
+    if (!prior) continue;
     const candidates = reads
       .filter(
         (read) =>
@@ -1540,7 +1868,24 @@ function detectCompactionLoops(events: AnalysisEvent[], calls: AnalysisEvent[]):
           timestampDistance(read, compact) <= 10 * 60 * 1000,
       )
       .sort(compareEvents);
-    const match = candidates.find((read) => Boolean(read.contentHash && read.filePath));
+    const priorFingerprints = new Set(
+      reads
+        .filter(
+          (read) =>
+            read.actorId === compact.actorId &&
+            compareEvents(read, compact) < 0 &&
+            read.filePath &&
+            read.contentHash,
+        )
+        .map((read) => [read.filePath, read.fileRange ?? 'unknown-range', read.contentHash].join('|')),
+    );
+    const match = candidates.find((read) =>
+      Boolean(
+        read.contentHash &&
+          read.filePath &&
+          priorFingerprints.has([read.filePath, read.fileRange ?? 'unknown-range', read.contentHash].join('|')),
+      ),
+    );
     if (match) cycles.push({ compact, read: match });
   }
   const anomalies: Anomaly[] = [];
@@ -1618,6 +1963,8 @@ function createSessions(calls: AnalysisEvent[], rates: RateSnapshot[]): Analysis
     const current = map.get(key);
     if (current) {
       current.ownCalls.push(call);
+      if (call.sessionTitle) current.title = call.sessionTitle;
+      if (call.cwd) current.cwd = call.cwd;
       if (call.timestamp && (!current.lastDataAt || call.timestamp > current.lastDataAt)) {
         current.lastDataAt = call.timestamp;
       }
@@ -1627,6 +1974,7 @@ function createSessions(calls: AnalysisEvent[], rates: RateSnapshot[]): Analysis
       id: call.sessionId,
       provider: call.provider,
       title: call.sessionTitle ?? call.sessionId,
+      cwd: call.cwd,
       parentSessionId: call.parentSessionId,
       childSessionIds: [],
       ownCalls: [call],
@@ -1735,6 +2083,7 @@ export function buildAnalysis(
   } = {},
 ): AnalysisResult {
   const events = dedupeAndDelta(inputEvents);
+  assignModelCallIds(events);
   const calls = events.filter((event) => event.kind === 'model' && event.scope !== 'summary');
   const reportedSummaries = events.filter(
     (event) => event.kind === 'model' && event.scope === 'summary' && event.reportedCostUsd !== undefined,
@@ -1772,8 +2121,65 @@ export function buildAnalysis(
   for (const anomaly of result.anomalies) {
     anomaly.necessary = anomaly.candidateCallIds.length > 0 &&
       anomaly.candidateCallIds.every((id) => necessaryCallIds.has(id));
+    const associated = anomaly.callIds
+      .map((id) => calls.find((call) => call.id === id))
+      .filter((item): item is AnalysisEvent => Boolean(item));
+    anomaly.associatedCost = calculateCost(associated, rates);
   }
   return result;
+}
+
+/** Scope normalized usage, never raw cumulative snapshots. Keep historical evidence
+ * for anomaly detection, but charge only calls inside the selected window. */
+export function scopeAnalysis(
+  analysis: AnalysisResult,
+  options: { since?: number; until?: number; provider?: Provider } = {},
+): AnalysisResult {
+  const hasWindow = options.since !== undefined || options.until !== undefined;
+  if (!hasWindow && !options.provider) return analysis;
+  const matches = (event: AnalysisEvent) => {
+    if (options.provider && event.provider !== options.provider) return false;
+    if (!hasWindow) return true;
+    const time = Date.parse(event.timestamp);
+    return Number.isFinite(time) && time >= (options.since ?? -Infinity) && time <= (options.until ?? Infinity);
+  };
+  const calls = analysis.calls.filter(matches);
+  const byId = new Map(calls.map((call) => [call.id, call]));
+  const anomalies = analysis.anomalies.filter((item) => item.callIds.some((id) => byId.has(id))).map((item) => {
+    const callIds = item.callIds.filter((id) => byId.has(id));
+    const candidateCallIds = item.candidateCallIds.filter((id) => byId.has(id));
+    return {
+      ...item,
+      callIds,
+      candidateCallIds,
+      baselineCallIds: item.baselineCallIds.filter((id) => byId.has(id)),
+      necessary: candidateCallIds.length > 0 && candidateCallIds.every((id) => analysis.necessaryCallIds.has(id)),
+      associatedCost: calculateCost(callIds.map((id) => byId.get(id)!), analysis.rates),
+    };
+  });
+  const events = analysis.events.filter(matches);
+  // A session-wide reported bill cannot be allocated to a smaller time window.
+  const reportedSummaries = hasWindow ? [] : events.filter((event) => event.kind === 'model' && event.scope === 'summary');
+  return {
+    ...analysis,
+    events,
+    calls,
+    sessions: createSessions(calls, analysis.rates),
+    anomalies,
+    usage: calls.reduce((summary, call) => addUsage(summary, call.usage), emptyUsage()),
+    cost: calculateCost(calls, analysis.rates, reportedSummaries),
+    candidateCost: candidateCost(anomalies, calls, analysis.rates, analysis.necessaryCallIds),
+    lastDataAt: calls.filter((call) => Number.isFinite(Date.parse(call.timestamp)))
+      .reduce<string | undefined>((latest, call) => !latest || Date.parse(call.timestamp) > Date.parse(latest) ? call.timestamp : latest, undefined),
+  };
+}
+
+export function costForCalls(
+  calls: AnalysisEvent[],
+  rates: RateSnapshot[],
+  reportedSummaries: AnalysisEvent[] = [],
+): CostSummary {
+  return calculateCost(calls, rates, reportedSummaries);
 }
 
 function demoCall(
@@ -1865,14 +2271,15 @@ export function createDemoAnalysis(): AnalysisResult {
       demoCall('demo-call-' + String(index++), 'codex', realtime, '修复 WebSocket 重连逻辑', 'gpt-5.6-terra', at(minutes), 'code', 210_000, 28_000),
     );
   }
-  const readTimes = [20, 18, 16];
+  const readTimes = [40, 20, 18, 16];
   readTimes.forEach((minutes, readIndex) => {
+    const callId = readIndex === 0 ? 'demo-call-7' : 'demo-call-' + String(5 + readIndex);
     events.push(
       demoTool(
         'demo-read-' + String(readIndex),
         at(minutes),
         auth,
-        'demo-call-8',
+        callId,
         'tool',
         {
           toolName: 'Read',
@@ -1881,17 +2288,19 @@ export function createDemoAnalysis(): AnalysisResult {
           fileRange: '1-180',
           contentHash: 'session-file-v1',
           complete: true,
+          modelCallId: callId,
         },
       ),
     );
   });
   [12, 11, 10].forEach((minutes, pollIndex) => {
+    const callId = 'demo-call-' + String(7 + pollIndex);
     events.push(
       demoTool(
         'demo-poll-' + String(pollIndex),
         at(minutes),
         auth,
-        'demo-call-' + String(7 + pollIndex),
+        callId,
         'wait',
         {
           toolName: 'wait_for_agent',
@@ -1899,25 +2308,27 @@ export function createDemoAnalysis(): AnalysisResult {
           target: child,
           stateHash: 'child-still-running',
           pureWait: true,
+          modelCallId: callId,
         },
       ),
     );
   });
   [30, 25].forEach((minutes, compactIndex) => {
+    const callId = 'demo-call-' + String(7 + compactIndex);
     events.push(
       demoTool(
         'demo-compact-' + String(compactIndex),
         at(minutes),
         auth,
-        'demo-call-' + String(7 + compactIndex),
+        callId,
         'compaction',
-        {},
+        { modelCallId: callId },
       ),
       demoTool(
         'demo-recovery-read-' + String(compactIndex),
         at(minutes - 1),
         auth,
-        'demo-call-' + String(7 + compactIndex),
+        callId,
         'tool',
         {
           toolName: 'Read',
@@ -1926,6 +2337,7 @@ export function createDemoAnalysis(): AnalysisResult {
           fileRange: '1-180',
           contentHash: 'session-file-v1',
           complete: true,
+          modelCallId: callId,
         },
       ),
     );
@@ -1970,7 +2382,8 @@ export function formatRelativeTime(value?: string): string {
   const seconds = Math.max(0, Math.round((Date.now() - date.getTime()) / 1000));
   if (seconds < 60) return seconds + ' 秒前';
   if (seconds < 3600) return Math.floor(seconds / 60) + ' 分钟前';
-  return Math.floor(seconds / 3600) + ' 小时前';
+  if (seconds < 86400) return Math.floor(seconds / 3600) + ' 小时前';
+  return Math.floor(seconds / 86400) + ' 天前';
 }
 
 export function providerLabel(provider: Provider): string {

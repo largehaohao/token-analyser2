@@ -1,4 +1,5 @@
 import type { Provider } from './analysis';
+import { isSessionLogFile } from './jsonl-cursor';
 
 export interface SourceDocument {
   id: string;
@@ -110,7 +111,7 @@ async function walkDirectory(
   const result: Array<{ handle: FileHandleLike; relativePath: string }> = [];
   for await (const entry of directory.values()) {
     const relativePath = prefix ? prefix + '/' + entry.name : entry.name;
-    if (entry.kind === 'file' && entry.getFile) {
+    if (entry.kind === 'file' && entry.getFile && isSessionLogFile(entry.name)) {
       result.push({ handle: entry as FileHandleLike, relativePath });
     } else if (entry.kind === 'directory' && entry.values) {
       result.push(...(await walkDirectory(entry as DirectoryHandleLike, relativePath)));

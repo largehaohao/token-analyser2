@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   buildAnalysis,
+  scopeAnalysis,
   defaultRateSnapshots,
+  formatRelativeTime,
   parseJsonl,
   type AnalysisEvent,
   type RateSnapshot,
@@ -94,6 +96,112 @@ test('parses Codex usage and read evidence from native JSONL', () => {
   assert.equal(read?.filePath, 'src/app.ts');
   assert.equal(read?.fileRange, '1-3');
   assert.ok(read?.contentHash);
+});
+
+test('parses Codex desktop cumulative snapshots as distinct model calls with metadata', () => {
+  const jsonl = [
+    JSON.stringify({
+      timestamp: iso(0),
+      type: 'session_meta',
+      payload: {
+        session_id: 'desktop-main',
+        id: 'desktop-main',
+        base_instructions: { provenance: { type: 'model', model: 'gpt-5.6-sol' } },
+      },
+    }),
+    JSON.stringify({
+      timestamp: iso(1),
+      type: 'turn_context',
+      payload: { model: 'gpt-5.6-sol' },
+    }),
+    JSON.stringify({
+      timestamp: iso(2),
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: {
+          total_token_usage: { input_tokens: 80, cached_input_tokens: 60, output_tokens: 5, reasoning_output_tokens: 2 },
+          last_token_usage: { input_tokens: 80, cached_input_tokens: 60, output_tokens: 5, reasoning_output_tokens: 2 },
+        },
+      },
+    }),
+    JSON.stringify({
+      timestamp: iso(3),
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: {
+          total_token_usage: { input_tokens: 160, cached_input_tokens: 120, output_tokens: 11, reasoning_output_tokens: 4 },
+          last_token_usage: { input_tokens: 80, cached_input_tokens: 60, output_tokens: 6, reasoning_output_tokens: 2 },
+        },
+      },
+    }),
+  ].join('\n');
+
+  const parsed = parseJsonl(jsonl, { provider: 'codex', sourceFile: 'desktop.jsonl' });
+  const snapshots = parsed.events.filter((item) => item.kind === 'model' && item.usage);
+  assert.equal(snapshots.length, 2);
+  assert.equal(snapshots[0]?.model, 'gpt-5.6-sol');
+  assert.equal(snapshots[1]?.model, 'gpt-5.6-sol');
+  assert.equal(snapshots[0]?.sourceLine, 3);
+  assert.equal(snapshots[1]?.sourceLine, 4);
+
+  const analysis = buildAnalysis(parsed.events, defaultRateSnapshots);
+  assert.equal(analysis.calls.length, 2);
+  assert.equal(analysis.usage.totalTokens, 171);
+  assert.equal(analysis.sessions[0]?.id, 'desktop-main');
+});
+
+test('recognizes Codex desktop shell reads and object-shaped tool output', () => {
+  const jsonl = [
+    JSON.stringify({
+      timestamp: iso(0),
+      type: 'response_item',
+      payload: {
+        type: 'custom_tool_call',
+        call_id: 'exec-read-1',
+        name: 'exec',
+        input: 'sed -n \'1,20p\' /workspace/src/app.ts',
+      },
+    }),
+    JSON.stringify({
+      timestamp: iso(1),
+      type: 'response_item',
+      payload: {
+        type: 'custom_tool_call_output',
+        call_id: 'exec-read-1',
+        output: [{ type: 'text', text: 'const answer = 42;\n' }],
+      },
+    }),
+    JSON.stringify({
+      timestamp: iso(2),
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: { total_token_usage: { input_tokens: 100, output_tokens: 10 } },
+      },
+    }),
+  ].join('\n');
+
+  const parsed = parseJsonl(jsonl, { provider: 'codex', sourceFile: 'desktop.jsonl' });
+  const read = parsed.events.find((item) => item.kind === 'tool');
+  assert.equal(parsed.errors.length, 0);
+  assert.equal(read?.behavior, 'read');
+  assert.equal(read?.filePath, '/workspace/src/app.ts');
+  assert.ok(read?.contentHash);
+  assert.equal(read?.complete, true);
+
+  // The live collector strips raw tool payloads before sending them to the
+  // browser. Behaviour metadata on the tool event must still be sufficient to
+  // attribute the nearby model snapshot as a read.
+  const compacted = parsed.events.map((item) => {
+    const copy = { ...item };
+    delete copy.toolInput;
+    delete copy.toolOutput;
+    return copy;
+  });
+  const compactedAnalysis = buildAnalysis(compacted, defaultRateSnapshots, { mode: 'live' });
+  assert.equal(compactedAnalysis.calls[0]?.behavior, 'read');
 });
 
 test('does not double count Claude assistant usage and result tree summary', () => {
@@ -374,6 +482,7 @@ test('preserves a source supplied session title without using prompt text as a t
       type: 'session_meta',
       session_id: 'titled-session',
       title: 'Refactor auth',
+      cwd: '/projects/auth-app',
     }),
     JSON.stringify({
       type: 'assistant',
@@ -383,6 +492,9 @@ test('preserves a source supplied session title without using prompt text as a t
   ].join('\n'), { provider: 'codex', sourceFile: 'titled.jsonl' });
 
   assert.equal(parsed.events.find((item) => item.kind === 'model')?.sessionTitle, 'Refactor auth');
+  const session = buildAnalysis(parsed.events, [rate]).sessions[0];
+  assert.equal(session.cwd, '/projects/auth-app');
+  assert.equal(session.title, 'Refactor auth');
 });
 
 test('infers Claude Code from native cache fields when the filename is generic', () => {
@@ -412,8 +524,9 @@ test('parses the checked-in Claude fixture with cached and tool evidence', async
   assert.equal(parsed.events.find((item) => item.kind === 'model')?.usage?.cachedInputTokens, 40);
   const analysis = buildAnalysis(parsed.events, defaultRateSnapshots);
   assert.equal(analysis.calls.length, 1);
-  assert.equal(analysis.cost.usd, 0.25);
-  assert.equal(analysis.cost.complete, false);
+  assert.ok((analysis.cost.usd ?? 0) > 0);
+  assert.equal(analysis.cost.unknownCalls, 0);
+  assert.match(analysis.cost.basis, /Anthropic/);
 });
 
 test('keeps mixed model calls out of the optimizable cost subtotal', () => {
@@ -500,7 +613,7 @@ test('keeps a source reported result cost as an estimate when token detail is ab
 });
 
 test('isolates malformed lines with their source location', () => {
-  const parsed = parseJsonl('{"type":"user","text":"ok"}\nnot-json', {
+  const parsed = parseJsonl('{"type":"user","text":"ok"}\nnot-json\n', {
     provider: 'codex',
     sourceFile: 'broken.jsonl',
   });
@@ -508,6 +621,158 @@ test('isolates malformed lines with their source location', () => {
   assert.equal(parsed.events.length, 1);
   assert.equal(parsed.errors[0]?.sourceFile, 'broken.jsonl');
   assert.equal(parsed.errors[0]?.line, 2);
+});
+
+test('waits for an incomplete trailing line instead of recording a parse error', () => {
+  const parsed = parseJsonl('{"type":"user","text":"ok"}\n{"type":"assistant","session_id":"s"', {
+    provider: 'codex',
+    sourceFile: 'growing.jsonl',
+  });
+
+  assert.equal(parsed.errors.length, 0);
+  assert.equal(parsed.events.some((item) => item.kind === 'user'), true);
+});
+
+test('attributes reread candidate cost to model calls parsed from native Claude JSONL', () => {
+  const jsonl = [0, 1, 2].map((index) =>
+    JSON.stringify({
+      type: 'assistant',
+      session_id: 'reread-session',
+      timestamp: iso(index * 30),
+      message: {
+        id: 'msg-' + String(index),
+        model: 'claude-sonnet-4',
+        usage: { input_tokens: 1_000_000, output_tokens: 0 },
+        content: [
+          {
+            type: 'tool_use',
+            id: 'read-' + String(index),
+            name: 'Read',
+            input: { file_path: 'src/app.ts', start_line: 1, end_line: 3 },
+          },
+        ],
+      },
+    }),
+  ).join('\n');
+  const outputs = [0, 1, 2].map((index) =>
+    JSON.stringify({
+      type: 'user',
+      session_id: 'reread-session',
+      timestamp: iso(index * 30 + 1),
+      message: {
+        content: [{ type: 'tool_result', tool_use_id: 'read-' + String(index), content: 'same-file-body' }],
+      },
+    }),
+  ).join('\n');
+  const parsed = parseJsonl([jsonl, outputs].join('\n'), {
+    provider: 'claude',
+    sourceFile: 'reread.jsonl',
+  });
+  const analysis = buildAnalysis(parsed.events, [{ ...rate, id: 'claude-rate', provider: 'claude' }]);
+  const reread = analysis.anomalies.find((item) => item.type === 'reread');
+
+  assert.equal(parsed.events.filter((item) => item.kind === 'model' && item.usage).length, 3);
+  assert.ok(reread);
+  assert.equal(reread?.candidateCallIds.length, 2);
+  assert.equal(analysis.candidateCost.usd, 2);
+  assert.ok(reread?.candidateCallIds.every((id) => analysis.calls.some((call) => call.id === id)));
+});
+
+test('does not treat a Claude Task tool as a wait', () => {
+  const parsed = parseJsonl(JSON.stringify({
+    type: 'assistant',
+    session_id: 'task-session',
+    message: {
+      id: 'msg-task',
+      model: 'claude-sonnet-4',
+      usage: { input_tokens: 10, output_tokens: 2 },
+      content: [{ type: 'tool_use', id: 'task-1', name: 'Task', input: { prompt: 'review' } }],
+    },
+  }), { provider: 'claude', sourceFile: 'task.jsonl' });
+  const tool = parsed.events.find((item) => item.kind === 'tool' || item.kind === 'wait');
+
+  assert.equal(tool?.kind, 'tool');
+  assert.equal(tool?.behavior, 'subagent');
+  assert.notEqual(tool?.pureWait, true);
+});
+
+test('leaves model calls without tools as unknown behavior instead of planning', () => {
+  const parsed = parseJsonl(JSON.stringify({
+    type: 'assistant',
+    session_id: 'plain',
+    message: { id: 'msg-plain', model: 'claude-sonnet-4', usage: { input_tokens: 10, output_tokens: 2 } },
+  }), { provider: 'claude', sourceFile: 'plain.jsonl' });
+
+  assert.equal(parsed.events.find((item) => item.kind === 'model')?.behavior, 'unknown');
+});
+
+test('does not mark a wait tool as pure wait when its result is missing', () => {
+  const parsed = parseJsonl(JSON.stringify({
+    timestamp: iso(0),
+    type: 'response_item',
+    payload: { type: 'function_call', call_id: 'wait-1', name: 'wait_for_agent', arguments: '{"target":"child"}' },
+  }), { provider: 'codex', sourceFile: 'wait.jsonl' });
+  const wait = parsed.events.find((item) => item.toolName === 'wait_for_agent');
+
+  assert.equal(wait?.pureWait, false);
+});
+
+test('records parentUuid from session metadata onto the child analysis unit', () => {
+  const parsed = parseJsonl([
+    JSON.stringify({ type: 'system', subtype: 'init', sessionId: 'child-1', parentUuid: 'parent-1' }),
+    JSON.stringify({
+      type: 'assistant',
+      session_id: 'child-1',
+      message: { id: 'child-msg', model: 'claude-sonnet-4', usage: { input_tokens: 10, output_tokens: 2 } },
+    }),
+    JSON.stringify({
+      type: 'assistant',
+      session_id: 'parent-1',
+      message: { id: 'parent-msg', model: 'claude-sonnet-4', usage: { input_tokens: 20, output_tokens: 2 } },
+    }),
+  ].join('\n'), { provider: 'claude', sourceFile: 'tree.jsonl' });
+  const analysis = buildAnalysis(parsed.events, [{ ...rate, id: 'claude-rate', provider: 'claude' }]);
+  const child = analysis.sessions.find((item) => item.id === 'child-1');
+
+  assert.equal(child?.parentSessionId, 'parent-1');
+  assert.equal(analysis.sessions.find((item) => item.id === 'parent-1')?.childSessionIds.includes('child-1'), true);
+});
+
+test('matches a dated Claude model name to the official snapshot', () => {
+  const analysis = buildAnalysis([
+    event({
+      provider: 'claude',
+      model: 'claude-sonnet-4-20250514',
+      usage: { inputTokens: 1_000_000, outputTokens: 0 },
+    }),
+  ], defaultRateSnapshots);
+
+  assert.equal(analysis.cost.hasKnownAmount, true);
+  assert.ok((analysis.cost.usd ?? 0) > 0);
+  assert.equal(analysis.cost.unknownCalls, 0);
+});
+
+test('does not flag compaction recovery of a file that was never read before the compact', () => {
+  const events = [0, 1].flatMap((index) => [
+    event({ id: 'compact-' + String(index), timestamp: iso(index * 60), kind: 'compaction' }),
+    event({
+      id: 'new-read-' + String(index),
+      timestamp: iso(index * 60 + 1),
+      kind: 'tool',
+      toolName: 'Read',
+      filePath: 'src/new.ts',
+      fileRange: '1-3',
+      contentHash: 'brand-new',
+    }),
+  ]);
+  const analysis = buildAnalysis(events, [rate]);
+
+  assert.equal(analysis.anomalies.some((item) => item.type === 'compaction'), false);
+});
+
+test('formats relative times older than a day in days', () => {
+  const stamp = new Date(Date.now() - 50 * 60 * 60 * 1000).toISOString();
+  assert.match(formatRelativeTime(stamp), /天前/);
 });
 
 test('isolates a file read failure while retaining other directory documents', async () => {
@@ -524,4 +789,76 @@ test('isolates a file read failure while retaining other directory documents', a
   assert.equal(documents.length, 2);
   assert.equal(documents.find((item) => item.name === 'good.jsonl')?.content, '{"type":"assistant"}');
   assert.match(documents.find((item) => item.name === 'locked.jsonl')?.error ?? '', /permission denied/);
+});
+
+test('overview scopes normalized deltas and keeps all-time analysis unchanged', () => {
+  const full = buildAnalysis([100, 150, 200].map((inputTokens, index) => event({
+    id: `window-snapshot-${index}`, sourceLine: index + 1, timestamp: iso(index * 60),
+    scope: 'tree', usage: { inputTokens, outputTokens: 0, cumulative: true },
+  })), [rate]);
+  const scoped = scopeAnalysis(full, { since: Date.parse(iso(60)), until: Date.parse(iso(120)) });
+  assert.equal(scoped.usage.totalTokens, 100);
+  assert.equal(scoped.calls.length, 2);
+  assert.equal(scoped.cost.usd, 0.0001);
+  assert.equal(scoped.sessions[0].ownUsage.totalTokens, 100);
+  assert.equal(full.usage.totalTokens, 200);
+  assert.equal(scopeAnalysis(full), full);
+});
+
+test('overview includes exact time boundaries but excludes invalid, future and other providers', () => {
+  const full = buildAnalysis([
+    event({ id: 'before', timestamp: iso(-1) }),
+    event({ id: 'start', timestamp: iso(0) }),
+    event({ id: 'end', timestamp: iso(60) }),
+    event({ id: 'future', timestamp: iso(61) }),
+    event({ id: 'invalid', timestamp: 'not-a-date' }),
+    event({ id: 'other', timestamp: iso(30), provider: 'claude' }),
+  ].map((call) => ({ ...call, usage: { inputTokens: 100, outputTokens: 0 } })), [rate]);
+  const scoped = scopeAnalysis(full, { since: Date.parse(iso(0)), until: Date.parse(iso(60)), provider: 'codex' });
+  assert.deepEqual(scoped.calls.map((call) => call.id), ['start', 'end']);
+  assert.equal(scoped.lastDataAt, iso(60));
+  assert.equal(scoped.usage.totalTokens, 200);
+  assert.equal(scopeAnalysis(full, { provider: 'codex' }).calls.length, 5);
+  assert.equal(scopeAnalysis(full, { since: Date.parse(iso(120)) }).sessions.length, 0);
+});
+
+test('overview preserves historical anomaly evidence but only prices in-window candidates', () => {
+  const full = buildAnalysis([0, 60, 120].flatMap((seconds, index) => [
+    event({ id: `window-call-${index}`, timestamp: iso(seconds), usage: { inputTokens: 1_000_000, outputTokens: 0 } }),
+    event({ id: `window-read-${index}`, timestamp: iso(seconds), kind: 'tool', callId: `window-call-${index}`,
+      toolName: 'Read', filePath: 'src/app.ts', fileRange: '1-3', contentHash: 'same' }),
+  ]), [rate]);
+  const scoped = scopeAnalysis(full, { since: Date.parse(iso(120)), until: Date.parse(iso(121)) });
+  assert.equal(scoped.anomalies.length, 1);
+  assert.deepEqual(scoped.anomalies[0].callIds, ['window-call-2']);
+  assert.equal(scoped.anomalies[0].evidence.length, full.anomalies[0].evidence.length);
+  assert.equal(scoped.anomalies[0].associatedCost?.usd, 1);
+  assert.equal(scoped.candidateCost.usd, 1);
+  assert.equal(full.cost.usd, 3);
+  assert.equal(scopeAnalysis({ ...full, necessaryCallIds: new Set(['window-call-2']) }, {
+    since: Date.parse(iso(120)), until: Date.parse(iso(121)),
+  }).candidateCost.usd, 0);
+});
+
+test('overview never allocates a whole-session reported bill into a time window', () => {
+  const full = buildAnalysis([
+    event({ id: 'window-summary', scope: 'summary', reportedCostUsd: 99 }),
+  ], [rate]);
+  assert.equal(scopeAnalysis(full, { provider: 'codex' }).cost.usd, 99);
+  const scoped = scopeAnalysis(full, { since: Date.parse(iso(0)), until: Date.parse(iso(60)) });
+  assert.equal(scoped.cost.usd, 0);
+  assert.equal(scoped.calls.length, 0);
+});
+
+test('overview retains a child active in the window without importing parent usage', () => {
+  const full = buildAnalysis([
+    event({ id: 'old-parent', timestamp: iso(0), usage: { inputTokens: 1000, outputTokens: 0 } }),
+    event({ id: 'recent-child', sessionId: 'child', actorId: 'child', parentSessionId: 'main',
+      timestamp: iso(60), usage: { inputTokens: 200, outputTokens: 0 } }),
+  ], [rate]);
+  const scoped = scopeAnalysis(full, { since: Date.parse(iso(60)), until: Date.parse(iso(120)) });
+  assert.equal(scoped.sessions.length, 1);
+  assert.equal(scoped.sessions[0].id, 'child');
+  assert.equal(scoped.sessions[0].inclusiveUsage.totalTokens, scoped.usage.totalTokens);
+  assert.equal(scoped.usage.totalTokens, 200);
 });

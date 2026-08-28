@@ -5,9 +5,10 @@ const STORAGE_KEY = 'tokenscope.preferences.v1';
 export interface Preferences {
   customRates: RateSnapshot[];
   currency: 'usd' | 'credits';
+  livePath: string;
 }
 
-const defaults: Preferences = { customRates: [], currency: 'usd' };
+const defaults: Preferences = { customRates: [], currency: 'usd', livePath: '~/.codex' };
 
 function validRate(value: unknown): value is RateSnapshot {
   if (!value || typeof value !== 'object') return false;
@@ -37,6 +38,9 @@ export function loadPreferences(): Preferences {
     return {
       customRates,
       currency: record.currency === 'credits' ? 'credits' : 'usd',
+      livePath: typeof record.livePath === 'string' && record.livePath.trim()
+        ? record.livePath.slice(0, 1024)
+        : defaults.livePath,
     };
   } catch {
     return { ...defaults };
@@ -48,6 +52,7 @@ export function savePreferences(preferences: Preferences): void {
   const safe: Preferences = {
     currency: preferences.currency === 'credits' ? 'credits' : 'usd',
     customRates: preferences.customRates.filter(validRate).slice(0, 50),
+    livePath: (preferences.livePath ?? '').trim().slice(0, 1024),
   };
   try {
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(safe));
@@ -60,4 +65,3 @@ export function clearSessionOnly(): void {
   // Raw events and analysis results intentionally never enter localStorage.
   // This named seam makes the explicit exit action auditable.
 }
-

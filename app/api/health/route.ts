@@ -1,8 +1,7 @@
 export function GET(): Response {
   return Response.json({
     status: 'ok',
-    service: 'tokenscope-local-collector',
-    readOnly: true,
+    service: 'tokenscope-dashboard',
     timestamp: new Date().toISOString(),
   });
 }

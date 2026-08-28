@@ -1,7 +1,10 @@
 'use client';
 
 import Link from 'next/link';
+import { contextInventoryIndex, contextSessionKey, type ContextCategory, type SessionContextInventory } from '@/lib/context-inventory';
+import { callContentIndex, formatCallAmount, paginate, SESSION_TIME_RANGES, sessionDisplayName, sessionsInTimeRange, tokenComposition, type CallContent, type SessionTimeRange } from '@/lib/session-view';
 import {
+  Fragment,
   useCallback,
   useEffect,
   useMemo,
@@ -9,8 +12,8 @@ import {
   useState,
 } from 'react';
 import {
-  behaviorLabel,
   buildAnalysis,
+  scopeAnalysis,
   createDemoAnalysis,
   defaultRateSnapshots,
   demoRateSnapshots,
@@ -21,7 +24,9 @@ import {
   parseJsonl,
   providerLabel,
   usageTokenCount,
+  costForCalls,
   type AnalysisEvent,
+  type AnalysisSession,
   type AnalysisResult,
   type Anomaly,
   type Behavior,
@@ -30,10 +35,7 @@ import {
   type RateSnapshot,
 } from '@/lib/analysis';
 import {
-  chooseDirectoryDocuments,
   readFileDocuments,
-  startDirectoryWatcher,
-  supportsDirectoryPicking,
   type SourceDocument,
 } from '@/lib/collector';
 import {
@@ -46,6 +48,7 @@ import {
 type View = 'overview' | 'sessions' | 'insights' | 'subagents' | 'settings';
 type Currency = 'usd' | 'credits';
 type CollectorStatus = 'idle' | 'loading' | 'collecting' | 'stopped' | 'error';
+const COLLECTOR_URL = 'http://127.0.0.1:8787/api/collector';
 type SessionSort = 'updated' | 'tokens' | 'cost' | 'growth';
 
 const NAV_ITEMS: Array<{ id: View; label: string; icon: string }> = [
@@ -123,17 +126,14 @@ function completenessLabel(result: AnalysisResult): string {
 }
 
 function eventLabel(event: AnalysisEvent): string {
+  if (event.kind === 'context') return '上下文目录快照';
+  if (event.kind === 'assistant') return 'Agent 回复';
   if (event.kind === 'model') return event.scope === 'summary' ? '来源费用汇总' : '模型调用';
   if (event.kind === 'tool') return event.toolName || '工具执行';
   if (event.kind === 'wait') return '等待 / 轮询';
   if (event.kind === 'compaction') return '上下文压缩';
   if (event.kind === 'user') return '用户请求';
   return '未知记录';
-}
-
-function callCost(call: AnalysisEvent, rates: RateSnapshot[], currency: Currency): string {
-  const result = buildAnalysis([call], rates);
-  return displayCost(result.cost, currency).value;
 }
 
 function metricSubtext(summary: CostSummary): string {
@@ -184,16 +184,6 @@ function MetricCard({
       </div>
       <div className="metric-value">{value}</div>
       <div className="metric-caption">{caption}</div>
-      <div className="mini-spark" aria-hidden="true">
-        <i style={{ height: '18%' }} />
-        <i style={{ height: '36%' }} />
-        <i style={{ height: '28%' }} />
-        <i style={{ height: '54%' }} />
-        <i style={{ height: '45%' }} />
-        <i style={{ height: '70%' }} />
-        <i style={{ height: '58%' }} />
-        <i style={{ height: '88%' }} />
-      </div>
     </article>
   );
 }
@@ -229,10 +219,10 @@ function AnomalyCard({
   const allNecessary =
     anomaly.candidateCallIds.length > 0 &&
     anomaly.candidateCallIds.every((id) => analysis.necessaryCallIds.has(id));
-  const associated = buildAnalysis(
+  const associated = anomaly.associatedCost ?? costForCalls(
     analysis.calls.filter((call) => anomaly.callIds.includes(call.id)),
     analysis.rates,
-  ).cost;
+  );
   const associatedDisplay = displayCost(associated, currency);
   return (
     <article className={'anomaly-card' + (selected ? ' anomaly-card-selected' : '')}>
@@ -311,6 +301,154 @@ function EmptyState({
   );
 }
 
+function sessionBehaviorBreakdown(calls: AnalysisEvent[]) {
+  const totals = new Map<Behavior, number>();
+  for (const call of calls) {
+    const behavior = call.behavior;
+    const key: Behavior =
+      behavior === 'code' ||
+      behavior === 'subagent' ||
+      behavior === 'read' ||
+      behavior === 'wait' ||
+      behavior === 'planning'
+        ? behavior
+        : 'other';
+    totals.set(key, (totals.get(key) ?? 0) + usageTokenCount(call.usage));
+  }
+  const total = [...totals.values()].reduce((sum, value) => sum + value, 0);
+  return BEHAVIOR_KEYS.map((item) => ({
+    ...item,
+    tokens: totals.get(item.key) ?? 0,
+    percent: total ? Math.round(((totals.get(item.key) ?? 0) / total) * 100) : 0,
+  }));
+}
+
+function Pagination({ page, pageCount, total, start, end, onChange, label }: {
+  page: number; pageCount: number; total: number; start: number; end: number;
+  onChange: (page: number) => void; label: string;
+}) {
+  return <nav className="pagination" aria-label={label}>
+    <span role="status">第 {start}–{end} 条，共 {total} 条</span>
+    <div>
+      <button className="button secondary" disabled={page <= 1} onClick={() => onChange(1)} aria-label="第一页">«</button>
+      <button className="button secondary" disabled={page <= 1} onClick={() => onChange(page - 1)}>上一页</button>
+      <span>{page} / {pageCount} 页</span>
+      <button className="button secondary" disabled={page >= pageCount} onClick={() => onChange(page + 1)}>下一页</button>
+      <button className="button secondary" disabled={page >= pageCount} onClick={() => onChange(pageCount)} aria-label="最后一页">»</button>
+    </div>
+  </nav>;
+}
+
+function EventContent({ event, content, expanded = false }: { event: AnalysisEvent; content?: CallContent; expanded?: boolean }) {
+  const fields = event.kind === 'model'
+    ? [
+        { label: '用户请求（上下文）', text: content?.prompt },
+        { label: 'Agent 回复', text: content?.reply },
+        { label: '邻近工具操作', text: content?.operations.join('\n') },
+      ].filter((field) => field.text)
+    : [
+        { label: event.kind === 'user' ? '用户请求' : event.kind === 'assistant' ? 'Agent 回复' : '记录内容', text: event.text },
+        { label: '工具输入', text: event.toolInput },
+        { label: '工具结果', text: event.toolOutput },
+      ].filter((field) => field.text);
+  const preview = event.kind === 'model' ? content?.reply || content?.operations.join('\n') || content?.prompt : fields[0]?.text;
+  if (!preview) return <p className="call-content-empty">来源未记录可关联的内容摘录</p>;
+  const body = <div className="call-content-body">
+      {fields.map((field) => <section key={field.label}><strong>{field.label}</strong><pre>{field.text}</pre></section>)}
+      <small>日志原文摘录；邻近记录不代表精确的 Token 归属。较长内容可能已截断。</small>
+    </div>;
+  if (expanded) return body;
+  return <details className="call-content">
+    <summary><span className="call-content-preview">{preview}</span><span className="call-content-toggle">内容摘录 ▾</span></summary>
+    {body}
+  </details>;
+}
+
+function SessionContextPanel({ inventory, category, onCategory }: {
+  inventory?: SessionContextInventory; category: ContextCategory; onCategory: (category: ContextCategory) => void;
+}) {
+  const [pageNumber, setPageNumber] = useState(1);
+  const event = inventory?.[category];
+  const snapshot = event?.contextSnapshot;
+  const components = snapshot?.components ?? [];
+  const page = paginate(components, pageNumber, 15);
+  return <section className="context-panel" aria-label="Tools 和 Skills 上下文组成">
+    <div className="context-category-cards" role="group" aria-label="上下文类型">
+      {(['tools', 'skills'] as const).map((kind) => {
+        const current = inventory?.[kind]?.contextSnapshot;
+        return <button key={kind} aria-pressed={category === kind} onClick={() => { onCategory(kind); setPageNumber(1); }}>
+          <span>{kind === 'tools' ? 'Tools 定义' : 'Skills 目录'}</span>
+          <strong>{current ? current.chars.toLocaleString('en-US') + ' 字符' : '长度未知'}</strong>
+          <small>{current ? current.components.filter((part) => !part.overhead).length + ' 个条目 · 含公共说明' : '日志未记录定义 / 目录'}</small>
+        </button>;
+      })}
+    </div>
+    <p className="context-scope-note">仅展示本会话最近一份已记录定义 / 目录，不含子会话，不累计重复注入。字符数不是 Token 数；目录不等于已加载的 SKILL.md 全文，也不保证仍驻留在当前模型上下文中。</p>
+    {snapshot && event ? <>
+      <div className="context-snapshot-source"><strong>{category === 'tools' ? 'Tools' : 'Skills'} 组成 · {snapshot.format === 'json' ? 'JSON 序列化字符数' : '日志原文字符数'}</strong><span>{formatDateTime(event.timestamp)} · 已记录 {inventory?.observations[category]} 份</span><small>{event.sourceFile} · 第 {event.sourceLine} 行</small></div>
+      <Pagination {...page} onChange={setPageNumber} label="上下文组成分页" />
+      <div className="context-components">
+        {page.items.map((part, index) => <details className="context-component" key={page.start + index}>
+          <summary><span>{part.name}{part.overhead && <small>公共说明 / 格式</small>}</span><span className="context-part-size">{part.chars.toLocaleString('en-US')} 字符<small>{snapshot.chars ? (part.chars / snapshot.chars * 100).toFixed(1) : '0.0'}%</small></span></summary>
+          <pre>{part.text}{part.truncated ? '\n… [展示摘录已截断；上方长度按完整原文计算]' : ''}</pre>
+        </details>)}
+      </div>
+    </> : <EmptyState title={category === 'tools' ? '未记录完整 Tools 定义' : '未记录 Skills 目录'} description="无法从 Token 总量、工具调用次数或本机当前安装列表反推历史上下文长度。未知不表示没有使用。" />}
+    {category === 'tools' && !!inventory?.usedTools.size && <div className="observed-tools"><h3>实际调用过的工具（{inventory.usedTools.size} 种）</h3><p>仅作为调用证据，不代表工具定义清单或上下文占用。</p><div>{[...inventory.usedTools].sort((a, b) => b[1] - a[1]).map(([name, count]) => <span key={name}>{name}<small>{count.toLocaleString('en-US')} 次</small></span>)}</div></div>}
+  </section>;
+}
+
+function SessionCostTree({
+  session,
+  childSessions,
+  rates,
+  currency,
+}: {
+  session: AnalysisSession;
+  childSessions: AnalysisSession[];
+  rates: RateSnapshot[];
+  currency: Currency;
+}) {
+  const breakdown = sessionBehaviorBreakdown(session.ownCalls);
+  const inclusiveCost = displayCost(session.inclusiveCost, currency);
+  return (
+    <section className="cost-tree-panel" aria-label="成本树">
+      <div className="cost-tree-heading">
+        <div><h3>成本树</h3><p>自身调用按行为归因，子会话单独列出</p></div>
+        <strong>{inclusiveCost.value}</strong>
+      </div>
+      <div className="cost-tree-rows">
+        <div className="cost-tree-row cost-tree-root">
+          <span><i>└─</i>{sessionDisplayName(session)}</span>
+          <b>{formatTokenCount(session.inclusiveUsage.totalTokens)}</b>
+          <em>{inclusiveCost.value}</em>
+        </div>
+        {breakdown.filter((item) => item.tokens > 0).map((item) => {
+          const calls = session.ownCalls.filter((call) => {
+            const behavior = call.behavior;
+            const key = behavior === 'code' || behavior === 'subagent' || behavior === 'read' || behavior === 'wait' || behavior === 'planning'
+              ? behavior
+              : 'other';
+            return key === item.key;
+          });
+          const cost = displayCost(costForCalls(calls, rates), currency);
+          return (
+            <div className="cost-tree-row cost-tree-leaf" key={item.key}>
+              <span><i>├─</i>{item.label}</span>
+              <b>{item.percent}% · {formatTokenCount(item.tokens)}</b>
+              <em>{cost.value}</em>
+            </div>
+          );
+        })}
+        {childSessions.length > 0 && <div className="cost-tree-row cost-tree-child">
+          <span>└─ {childSessions.length} 个直属子会话</span>
+          <b>在“子会话”中分页查看</b>
+        </div>}
+      </div>
+    </section>
+  );
+}
+
 export default function Home() {
   const initialDemo = useMemo(() => createDemoAnalysis(), []);
   const [view, setView] = useState<View>('overview');
@@ -320,17 +458,28 @@ export default function Home() {
   const [sourceErrors, setSourceErrors] = useState(initialDemo.errors);
   const [providerFilter, setProviderFilter] = useState<Provider | 'all'>('all');
   const [currency, setCurrency] = useState<Currency>('usd');
-  const [preferences, setPreferences] = useState<Preferences>({ customRates: [], currency: 'usd' });
+  const [preferences, setPreferences] = useState<Preferences>({ customRates: [], currency: 'usd', livePath: '' });
   const [preferencesReady, setPreferencesReady] = useState(false);
   const [necessaryCallIds, setNecessaryCallIds] = useState<Set<string>>(new Set());
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [selectedAnomalyId, setSelectedAnomalyId] = useState<string | null>(null);
-  const [expandedSessionIds, setExpandedSessionIds] = useState<Set<string>>(new Set());
+  const [sessionPage, setSessionPage] = useState(1);
+  const [sessionTimeRange, setSessionTimeRange] = useState<SessionTimeRange>('all');
+  const [sessionRangeNow, setSessionRangeNow] = useState(0);
+  const [overviewTimeRange, setOverviewTimeRange] = useState<SessionTimeRange>('all');
+  const [overviewRangeNow, setOverviewRangeNow] = useState(0);
+  const [subagentPage, setSubagentPage] = useState(1);
+  const [timelinePage, setTimelinePage] = useState(1);
+  const [expandedCallId, setExpandedCallId] = useState<string | null>(null);
+  const [childPage, setChildPage] = useState(1);
+  const [detailSection, setDetailSection] = useState<'summary' | 'calls' | 'children' | 'evidence' | 'context'>('summary');
+  const [contextCategory, setContextCategory] = useState<ContextCategory>('skills');
+  const [timelineScope, setTimelineScope] = useState<'model' | 'all'>('model');
   const [collectorStatus, setCollectorStatus] = useState<CollectorStatus>('idle');
   const [collectorMessage, setCollectorMessage] = useState('本地服务已就绪');
   const [trendMetric, setTrendMetric] = useState<Currency | 'tokens'>('usd');
   const [sessionSort, setSessionSort] = useState<SessionSort>('updated');
-  const [liveSupported, setLiveSupported] = useState(false);
+  const [livePath, setLivePath] = useState('');
   const [rateDraft, setRateDraft] = useState({
     provider: 'codex' as Provider,
     modelPattern: '*',
@@ -341,7 +490,23 @@ export default function Home() {
     source: '用户自定义费率',
   });
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const stopWatcherRef = useRef<(() => void) | null>(null);
+  const collectorRevision = useRef<string | undefined>(undefined);
+
+  useEffect(() => {
+    if (view !== 'sessions' || sessionTimeRange === 'all') return;
+    const refresh = () => setSessionRangeNow(Date.now());
+    const initial = window.setTimeout(refresh, 0);
+    const timer = window.setInterval(refresh, 60_000);
+    return () => { window.clearTimeout(initial); window.clearInterval(timer); };
+  }, [view, sessionTimeRange]);
+
+  useEffect(() => {
+    if (view !== 'overview' || overviewTimeRange === 'all') return;
+    const refresh = () => setOverviewRangeNow(Date.now());
+    const initial = window.setTimeout(refresh, 0);
+    const timer = window.setInterval(refresh, 60_000);
+    return () => { window.clearTimeout(initial); window.clearInterval(timer); };
+  }, [view, overviewTimeRange]);
 
   const rates = useMemo(
     () => [
@@ -356,7 +521,7 @@ export default function Home() {
       const loaded = loadPreferences();
       setPreferences(loaded);
       setCurrency(loaded.currency);
-      setLiveSupported(supportsDirectoryPicking());
+      setLivePath(loaded.livePath);
       setPreferencesReady(true);
     }, 0);
     return () => window.clearTimeout(timer);
@@ -364,8 +529,8 @@ export default function Home() {
 
   useEffect(() => {
     if (!preferencesReady) return;
-    savePreferences(preferences);
-  }, [preferences, preferencesReady]);
+    savePreferences({ ...preferences, livePath });
+  }, [preferences, preferencesReady, livePath]);
 
   const analysis = useMemo<AnalysisResult>(() => buildAnalysis(sourceEvents, rates, {
       mode: analysisMode,
@@ -374,20 +539,88 @@ export default function Home() {
       necessaryCallIds,
     }), [analysisMode, necessaryCallIds, rates, sourceErrors, sourceEvents, sourceLabel]);
 
+  const applyServerSnapshot = useCallback((
+    payload: {
+      revision?: string;
+      status?: CollectorStatus;
+      message?: string;
+      events?: AnalysisEvent[];
+      errors?: AnalysisResult['errors'];
+      sourceLabel?: string;
+      path?: string;
+    },
+    preserveSelection = true,
+  ) => {
+    if (payload.path) setLivePath(payload.path);
+    if (payload.events) {
+      setSessionRangeNow(Date.now());
+      setOverviewRangeNow(Date.now());
+      setSourceEvents(payload.events);
+      setSourceErrors(payload.errors ?? []);
+      collectorRevision.current = payload.revision;
+    }
+    if (payload.status === 'collecting' || payload.status === 'stopped' || payload.status === 'error') {
+      setAnalysisMode('live');
+      setSourceLabel(payload.sourceLabel ?? (payload.path ? '实时目录 · ' + payload.path : '实时采集'));
+    }
+    if (payload.status) setCollectorStatus(payload.status);
+    if (payload.message) setCollectorMessage(payload.message);
+    if (!preserveSelection) {
+      setSelectedSessionId(null);
+      setSelectedAnomalyId(null);
+    }
+  }, []);
+
   useEffect(() => {
     let active = true;
-    fetch('/api/health')
-      .then((response) => {
-        if (active && response.ok) setCollectorMessage('本地只读服务已连接');
+    fetch(COLLECTOR_URL)
+      .then(async (response) => {
+        if (!active || !response.ok) return;
+        const payload = (await response.json()) as {
+          status?: CollectorStatus;
+          message?: string;
+          events?: AnalysisEvent[];
+          errors?: AnalysisResult['errors'];
+          sourceLabel?: string;
+          path?: string;
+        };
+        if (payload.status === 'collecting' || payload.status === 'stopped') {
+          applyServerSnapshot(payload, true);
+        } else {
+          setCollectorMessage(payload.message ?? '本地只读服务已连接');
+        }
       })
       .catch(() => {
-        if (active) setCollectorMessage('本地服务状态待确认');
+        if (active) setCollectorMessage('本机采集服务未连接。请运行 npm run collector，关闭网页也不会停止它');
       });
     return () => {
       active = false;
-      stopWatcherRef.current?.();
     };
-  }, []);
+  }, [applyServerSnapshot]);
+
+  useEffect(() => {
+    if (collectorStatus !== 'collecting') return;
+    let active = true;
+    let timer: ReturnType<typeof setTimeout>;
+    const controller = new AbortController();
+    async function refresh() {
+      try {
+        const since = collectorRevision.current;
+        const response = await fetch(COLLECTOR_URL + (since ? '?since=' + encodeURIComponent(since) : ''), { signal: controller.signal });
+        if (response.ok) {
+          const payload = await response.json() as Parameters<typeof applyServerSnapshot>[0];
+          if (active) applyServerSnapshot(payload, true);
+        }
+      } catch {
+        if (active) setCollectorMessage('采集服务暂时无法连接，服务仍可能在本机运行');
+      } finally {
+        // A slow snapshot must finish before another request is sent.
+        if (active) timer = setTimeout(() => { void refresh(); }, 2000);
+      }
+    }
+    timer = setTimeout(() => { void refresh(); }, 2000);
+    return () => { active = false; clearTimeout(timer); controller.abort(); };
+  }, [applyServerSnapshot, collectorStatus]);
 
   const applyDocuments = useCallback(
     async (documents: SourceDocument[], mode: 'history' | 'live', label: string, preserveSelection = false) => {
@@ -452,40 +685,49 @@ export default function Home() {
     [applyDocuments],
   );
 
-  const handleDirectory = useCallback(async () => {
-    stopWatcherRef.current?.();
+  const handleLiveStart = useCallback(async () => {
+    const path = livePath.trim();
+    if (!path) {
+      setCollectorStatus('error');
+      setCollectorMessage('请输入本机日志目录路径，例如 ~/.codex（含 sessions 与 archived_sessions）');
+      return;
+    }
     setCollectorStatus('loading');
-    setCollectorMessage('等待选择本地日志目录');
+    setCollectorMessage('正在启动本机只读采集');
     try {
-      const picked = await chooseDirectoryDocuments();
-      await applyDocuments(picked.documents, 'live', '实时目录 · ' + (picked.directory.name ?? '已选择目录'));
-      stopWatcherRef.current = startDirectoryWatcher(
-        picked.directory,
-        async (documents) => {
-          await applyDocuments(documents, 'live', '实时目录 · ' + (picked.directory.name ?? '已选择目录'), true);
-        },
-        5000,
-        (error) => {
-          setCollectorStatus('error');
-          setCollectorMessage(error instanceof Error ? error.message : '实时目录读取失败，等待恢复');
-        },
-      );
+      const response = await fetch(COLLECTOR_URL, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'start', path }),
+      });
+      const payload = (await response.json()) as Parameters<typeof applyServerSnapshot>[0];
+      applyServerSnapshot(payload, false);
+      setPreferences((current) => ({ ...current, livePath: path }));
     } catch (error) {
       setCollectorStatus('error');
-      setCollectorMessage(error instanceof Error ? error.message : '目录选择已取消或失败');
+      setCollectorMessage(error instanceof Error ? error.message : '无法连接本机采集服务。请先运行 npm run collector');
     }
-  }, [applyDocuments]);
+  }, [applyServerSnapshot, livePath]);
 
   const stopCollection = useCallback(() => {
-    stopWatcherRef.current?.();
-    stopWatcherRef.current = null;
-    setCollectorStatus('stopped');
-    setCollectorMessage('采集已停止；当前结果仍可查看');
-  }, []);
+    void fetch(COLLECTOR_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'stop' }),
+    })
+      .then(async (response) => applyServerSnapshot((await response.json()) as Parameters<typeof applyServerSnapshot>[0], true))
+      .catch(() => {
+        setCollectorStatus('stopped');
+        setCollectorMessage('采集已停止；当前结果仍可查看');
+      });
+  }, [applyServerSnapshot]);
 
   const clearSession = useCallback(() => {
-    stopWatcherRef.current?.();
-    stopWatcherRef.current = null;
+    void fetch(COLLECTOR_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'clear' }),
+    }).catch(() => undefined);
     setSourceEvents([]);
     setSourceErrors([]);
     setAnalysisMode('history');
@@ -545,18 +787,20 @@ export default function Home() {
     [analysis.anomalies, analysis.sessions, providerFilter],
   );
   const selectedSession = analysis.sessions.find((session) => session.id === selectedSessionId);
-  const totalCost = displayCost(analysis.cost, currency);
+  const contextInventories = useMemo(() => contextInventoryIndex(analysis.events), [analysis.events]);
+  const callContents = useMemo(() => callContentIndex(analysis.events.filter((event) => event.sessionId === selectedSessionId)), [analysis.events, selectedSessionId]);
   const candidateCost = displayCost(analysis.candidateCost, currency);
-  const candidatePercent =
-    analysis.cost.usd && analysis.candidateCost.usd !== undefined
-      ? Math.round((analysis.candidateCost.usd / analysis.cost.usd) * 100)
-      : analysis.cost.credits && analysis.candidateCost.credits !== undefined
-        ? Math.round((analysis.candidateCost.credits / analysis.cost.credits) * 100)
-        : 0;
+  const overviewAnalysis = useMemo(() => {
+    const hours = SESSION_TIME_RANGES.find((range) => range.value === overviewTimeRange)?.hours;
+    return scopeAnalysis(analysis, {
+      provider: providerFilter === 'all' ? undefined : providerFilter,
+      ...(hours === undefined ? {} : { since: overviewRangeNow - hours * 3_600_000, until: overviewRangeNow }),
+    });
+  }, [analysis, overviewTimeRange, overviewRangeNow, providerFilter]);
 
   const allocation = useMemo(() => {
     const totals = new Map<string, number>();
-    for (const call of analysis.calls) {
+    for (const call of overviewAnalysis.calls) {
       const behavior = call.behavior;
       const key =
         behavior === 'code' ||
@@ -574,102 +818,251 @@ export default function Home() {
       value: totals.get(item.key) ?? 0,
       percent: total ? Math.round(((totals.get(item.key) ?? 0) / total) * 100) : 0,
     }));
-  }, [analysis.calls]);
+  }, [overviewAnalysis.calls]);
 
   const trend = useMemo(() => {
+    const suspectIds = new Set(overviewAnalysis.anomalies.flatMap((anomaly) => anomaly.candidateCallIds));
+    const hourly = overviewTimeRange === '5h' || overviewTimeRange === '1d';
     const bucketMap = new Map<string, AnalysisEvent[]>();
-    for (const call of analysis.calls) {
+    for (const call of overviewAnalysis.calls) {
       const parsed = call.timestamp ? new Date(call.timestamp) : null;
       if (!parsed || Number.isNaN(parsed.getTime())) continue;
-      const key = parsed.toISOString().slice(0, 10);
+      const day = [parsed.getFullYear(), String(parsed.getMonth() + 1).padStart(2, '0'), String(parsed.getDate()).padStart(2, '0')].join('-');
+      const key = hourly ? day + ' ' + String(parsed.getHours()).padStart(2, '0') + ':00' : day;
       const current = bucketMap.get(key) ?? [];
       current.push(call);
       bucketMap.set(key, current);
     }
-    const entries = [...bucketMap.entries()].sort(([left], [right]) => left.localeCompare(right)).slice(-7);
+    const entries = [...bucketMap.entries()].sort(([left], [right]) => left.localeCompare(right));
     const values = entries.map(([key, calls]) => {
       const usage = calls.reduce((sum, call) => sum + usageTokenCount(call.usage), 0);
-      const cost = buildAnalysis(calls, rates).cost;
+      const cost = costForCalls(calls, rates);
       const value =
         trendMetric === 'tokens'
           ? usage
           : trendMetric === 'usd'
-            ? cost.usd ?? cost.credits ?? 0
-            : cost.credits ?? cost.usd ?? 0;
-      return { key, calls, value, usage, cost };
+            ? cost.usd ?? 0
+            : cost.credits ?? 0;
+      const suspectUsage = calls
+        .filter((call) => suspectIds.has(call.id))
+        .reduce((sum, call) => sum + usageTokenCount(call.usage), 0);
+      return { key, label: hourly ? key.slice(11) : key.slice(5).replace('-', '/'), calls, value, usage, cost, suspectShare: usage ? suspectUsage / usage : 0 };
     });
     const max = Math.max(...values.map((item) => item.value), 1);
-    return values.map((item) => ({ ...item, height: Math.max(8, Math.round((item.value / max) * 100)) }));
-  }, [analysis.calls, rates, trendMetric]);
+    return values.map((item) => {
+      const height = item.value > 0 ? Math.max(8, Math.round((item.value / max) * 100)) : 0;
+      return {
+        ...item,
+        height,
+        suspectHeight: Math.round(height * item.suspectShare),
+      };
+    });
+  }, [overviewAnalysis.anomalies, overviewAnalysis.calls, rates, trendMetric, overviewTimeRange]);
 
   const modeLabel = analysisMode === 'demo' ? '演示数据' : analysisMode === 'live' ? '实时采集' : '历史复盘';
   const navAnomalyCount = visibleAnomalies.length;
-  function toggleSession(sessionId: string) {
-    setExpandedSessionIds((current) => {
-      const next = new Set(current);
-      if (next.has(sessionId)) next.delete(sessionId);
-      else next.add(sessionId);
-      return next;
-    });
+  function openSession(sessionId: string, context?: ContextCategory) {
+    setExpandedCallId(null);
+    setSelectedSessionId(sessionId);
+    setDetailSection(context ? 'context' : 'summary');
+    if (context) setContextCategory(context);
+    setTimelinePage(1);
+    setChildPage(1);
+    setTimelineScope('model');
+    setView('sessions');
+    window.scrollTo({ top: 0 });
   }
 
-  function renderSessionRows() {
-    const visibleIds = new Set(visibleSessions.map((session) => session.id));
-    // A child whose parent log was not selected remains in the ledger as an
-    // orphan. It is shown at the top level with a partial-coverage cue rather
-    // than disappearing from the total.
-    const rows = visibleSessions.filter((session) => !session.parentSessionId || !visibleIds.has(session.parentSessionId));
-    if (!rows.length) {
-      return (
-        <tbody>
-          <tr><td colSpan={6}><EmptyState title="还没有可显示的会话" description="导入一份 Codex 或 Claude Code JSONL 日志开始复盘。" /></td></tr>
-        </tbody>
-      );
-    }
-    const anomalyCalls = new Set(visibleAnomalies.flatMap((anomaly) => anomaly.candidateCallIds));
-    return (
-      <>
-        {rows.map((session) => {
-          const suspectCount = session.ownCalls.filter((call) => anomalyCalls.has(call.id)).length;
-          const suspectPercent = session.ownCalls.length ? Math.round((suspectCount / session.ownCalls.length) * 100) : 0;
-          const cost = displayCost(session.inclusiveCost, currency);
-          const expanded = expandedSessionIds.has(session.id);
-          const children = visibleSessions.filter((item) => item.parentSessionId === session.id);
-          return (
-            <tbody key={session.id} className="session-group">
-              <tr className={selectedSessionId === session.id ? 'row-selected' : ''}>
-                <td><div className="session-name-cell">{children.length > 0 && <button className={'tree-toggle' + (expanded ? ' expanded' : '')} onClick={() => toggleSession(session.id)} aria-label={expanded ? '收起子会话' : '展开子会话'}>›</button>}<button className="session-link" onClick={() => setSelectedSessionId(session.id)}><strong>{session.title}</strong><small>{session.id}</small></button></div></td>
-                <td><SourceBadge provider={session.provider} /></td>
-                <td className="mono">{formatTokenCount(session.inclusiveUsage.totalTokens)}</td>
-                <td className={'mono cost-' + cost.tone}>{cost.value}<small>{cost.note}</small></td>
-                <td>{suspectPercent > 0 ? <span className="suspect-meter"><i style={{ width: suspectPercent + '%' }} /><em>{suspectPercent}%</em></span> : <span className="muted">—</span>}</td>
-                <td><span className="session-freshness">{session.lastDataAt ? '已记录' : '待更新'}</span></td>
-              </tr>
-              {expanded && children.map((child) => {
-                const childCost = displayCost(child.inclusiveCost, currency);
-                return <tr key={child.id} className="child-row"><td><div className="session-name-cell child-session"><span className="tree-branch">└</span><button className="session-link" onClick={() => setSelectedSessionId(child.id)}><strong>{child.title}</strong><small>{child.id}</small></button></div></td><td><SourceBadge provider={child.provider} /></td><td className="mono">{formatTokenCount(child.inclusiveUsage.totalTokens)}</td><td className={'mono cost-' + childCost.tone}>{childCost.value}<small>{childCost.note}</small></td><td><span className="muted">子会话</span></td><td><span className="session-freshness">已记录</span></td></tr>;
-              })}
-            </tbody>
-          );
-        })}
-      </>
-    );
+  function filterProvider(provider: Provider | 'all') {
+    setProviderFilter(provider);
+    setSessionPage(1);
+    setSubagentPage(1);
+    setSelectedSessionId(null);
   }
 
-  function renderTimeline(sessionId?: string) {
-    const events = analysis.events.filter((event) => !sessionId || event.sessionId === sessionId || event.parentSessionId === sessionId).slice(-80).reverse();
+  function renderSessionTable(sessions: AnalysisSession[]) {
+    return <div className="table-wrap session-table-viewport"><table>
+      <thead><tr><th>目录 - Session</th><th>Agent</th><th>自身 Token</th><th>含子会话</th><th>预估费用</th><th>Tools 字符</th><th>Skills 字符</th><th>最近数据</th></tr></thead>
+      <tbody>{sessions.length ? sessions.map((session) => {
+        const cost = displayCost(session.inclusiveCost, currency);
+        return <tr key={session.id}>
+          <td><button className="session-link" title={sessionDisplayName(session)} onClick={() => openSession(session.id)}>
+            <strong>{sessionDisplayName(session)}</strong>
+            <small>{session.parentSessionId ? '子会话 · ' : ''}{session.id}</small>
+          </button></td>
+          <td><SourceBadge provider={session.provider} /></td>
+          <td className="mono">{formatTokenCount(session.ownUsage.totalTokens)}</td>
+          <td className="mono">{formatTokenCount(session.inclusiveUsage.totalTokens)}</td>
+          <td className={'mono cost-' + cost.tone}>{cost.value}<small>{cost.note}</small></td>
+          {(['tools', 'skills'] as const).map((category) => {
+            const snapshot = contextInventories.get(contextSessionKey(session.provider, session.id))?.[category]?.contextSnapshot;
+            return <td key={category}><button className="context-length-link mono" title="最近记录的定义 / 目录字符数，点击查看组成；非 Token 用量" aria-label={category + ' 上下文 · ' + sessionDisplayName(session)} onClick={() => openSession(session.id, category)}>{snapshot ? snapshot.chars.toLocaleString('en-US') : '未知'}<small>查看组成 ↗</small></button></td>;
+          })}
+          <td>{formatRelativeTime(session.lastDataAt)}</td>
+        </tr>;
+      }) : <tr><td colSpan={8}><EmptyState title="还没有会话" description="导入日志或开始本机采集后查看。" /></td></tr>}</tbody>
+    </table></div>;
+  }
+
+  function renderSessionRows(sessions: AnalysisSession[]) {
+    if (!sessions.length) return <EmptyState title="当前范围内没有会话" description="请选择更长的时间范围、切换 Agent 或导入会话日志。" />;
+    const visibleIds = new Set(sessions.map((session) => session.id));
+    const recent = sessions.filter((session) => !session.parentSessionId || !visibleIds.has(session.parentSessionId)).slice(0, 6);
+    return renderSessionTable(recent);
+  }
+
+  function renderCallDetails(sessionId?: string) {
+    const events = analysis.events.filter((event) => (!sessionId || event.sessionId === sessionId) && (timelineScope === 'all' || event.kind === 'model')).reverse();
+    const page = paginate(events, timelinePage, 20);
     if (!events.length) return <EmptyState title="暂无调用明细" description="当前来源还没有可辨识的模型调用记录。" />;
-    return <div className="timeline">{events.map((event) => <div className="timeline-row" key={event.id}><span className={'timeline-marker marker-' + event.kind} aria-hidden="true" /><div className="timeline-main"><div className="timeline-head"><strong>{eventLabel(event)}</strong><span>{formatDateTime(event.timestamp)}</span></div><div className="timeline-detail">{event.kind === 'model' && event.usage ? formatTokenCount(usageTokenCount(event.usage)) + ' tokens · ' + (event.model ?? '模型未知') : event.kind === 'model' && event.scope === 'summary' ? '来源报告费用 · ' + formatMoney(event.reportedCostUsd, 'USD') : event.kind === 'tool' ? (event.toolName ?? '工具') + (event.filePath ? ' · ' + event.filePath : '') : event.kind === 'wait' ? (event.target ?? '目标未知') + ' · 状态 ' + (event.stateHash ? '未变化' : '未知') : event.kind === 'compaction' ? '上下文阶段发生压缩' : event.text?.slice(0, 120) || '来源记录无可显示摘要'}</div>{event.kind === 'model' && <span className="timeline-behavior" title={buildAnalysis([event], rates).cost.basis}>{event.scope === 'summary' ? '来源汇总' : behaviorLabel(event.behavior)} · {callCost(event, rates, currency)}</span>}</div></div>)}</div>;
+    const hasCacheWrites = events.some((event) => (event.usage?.cacheCreationInputTokens ?? 0) > 0);
+    const columnCount = hasCacheWrites ? 10 : 9;
+    const trendValues = page.items.filter((event) => event.kind === 'model' && event.usage).map((event) => tokenComposition(event.usage)!.total).reverse();
+    const maximum = Math.max(...trendValues, 1);
+    const points = trendValues.map((value, index) => ((index / Math.max(1, trendValues.length - 1)) * 160) + ',' + (32 - value / maximum * 28)).join(' ');
+    const count = (value?: number) => value === undefined ? '—' : value.toLocaleString('en-US');
+    const time = (timestamp: string) => {
+      const date = new Date(timestamp);
+      return Number.isNaN(date.getTime()) ? '时间未知' : date.toLocaleTimeString('zh-CN', { hour12: false });
+    };
+    return <section className="call-ledger" aria-label="调用明细表">
+      <div className="call-ledger-heading">
+        <div><h3>{timelineScope === 'model' ? '模型调用' : '事件'} ({events.length})</h3>
+          {trendValues.length > 1 && <svg className="call-sparkline" viewBox="0 0 160 36" role="img" aria-label="当前页 Token 趋势，时间从左到右"><polyline points={points} /></svg>}
+        </div>
+        <div className="token-legend"><span><i className="token-uncached" />未缓存</span><span><i className="token-cached" />缓存</span>{hasCacheWrites && <span><i className="token-cache-write" />缓存写入</span>}<span><i className="token-output" />输出</span></div>
+      </div>
+      <Pagination {...page} onChange={(next) => { setTimelinePage(next); setExpandedCallId(null); }} label="调用明细分页" />
+      <div className="call-table-viewport" key={page.page} tabIndex={0} role="region" aria-label="调用明细，可横向滚动">
+        <table className="call-table">
+          <thead><tr><th scope="col">时间</th><th scope="col">工具</th><th scope="col">内容 / 提示</th><th scope="col">构成</th><th scope="col">未缓存</th><th scope="col">缓存</th>{hasCacheWrites && <th scope="col">缓存写入</th>}<th scope="col">输出</th><th scope="col">Credits</th><th scope="col">$</th></tr></thead>
+          <tbody>{page.items.map((event) => {
+            const content = callContents.get(event.id);
+            const composition = tokenComposition(event.usage);
+            const cost = event.kind === 'model' ? costForCalls([event], rates) : undefined;
+            const summary = content?.prompt || content?.reply || event.text || event.toolInput || content?.operations.join('; ') || '来源未记录内容摘录';
+            const tools = event.toolName || [...new Set(content?.operations.map((operation) => operation.split(' · ')[0]) ?? [])].join(', ') || '—';
+            const open = expandedCallId === event.id;
+            const parts = composition ? [
+              { name: '未缓存', key: 'uncached', value: composition.uncached },
+              { name: '缓存', key: 'cached', value: composition.cached },
+              { name: '缓存写入', key: 'cache-write', value: composition.cacheWrite },
+              { name: '输出', key: 'output', value: composition.output },
+            ] : [];
+            return <Fragment key={event.id}>
+              <tr className={'call-data-row' + (open ? ' row-selected' : '')}>
+                <td className="mono" title={formatDateTime(event.timestamp)}>{time(event.timestamp)}</td>
+                <td className="call-tool-cell" title={tools}>{tools}</td>
+                <td className="call-prompt-cell"><button className="call-prompt" title={summary} aria-expanded={open} aria-controls={'call-excerpt-' + event.id} onClick={() => setExpandedCallId(open ? null : event.id)}><span aria-hidden="true">{open ? '▾' : '▸'}</span>{summary}</button></td>
+                <td>{composition ? <div className="token-stack" role="img" aria-label={parts.map((part) => part.name + ' ' + count(part.value)).join('，')} title={parts.map((part) => part.name + ': ' + count(part.value)).join(' · ')}>
+                  {parts.filter((part) => part.value > 0).map((part) => <i key={part.key} className={'token-' + part.key} style={{ width: (composition.total ? part.value / composition.total * 100 : 0) + '%' }} />)}
+                </div> : <span className="muted">—</span>}</td>
+                <td className="mono numeric">{count(composition?.uncached)}</td>
+                <td className="mono numeric">{count(composition?.cached)}</td>
+                {hasCacheWrites && <td className="mono numeric">{count(composition?.cacheWrite)}</td>}
+                <td className="mono numeric">{count(composition?.output)}</td>
+                <td className="mono numeric" title={cost?.basis || '无可计价用量'}>{formatCallAmount(cost?.credits, 'credits')}</td>
+                <td className="mono numeric" title={cost?.usd === undefined ? '暂无适用的美元费率或来源费用' : cost.basis}>{formatCallAmount(cost?.usd, 'usd')}</td>
+              </tr>
+              {open && <tr className="call-expanded-row"><td colSpan={columnCount}><div id={'call-excerpt-' + event.id}>
+                <div className="call-excerpt-heading"><strong>{eventLabel(event)} · {event.model || '模型未记录'}</strong><span>{formatDateTime(event.timestamp)}</span><button className="text-button" onClick={() => setExpandedCallId(null)}>收起摘录</button></div>
+                <EventContent event={event} content={content} expanded />
+                <p className="call-source">{event.sourceFile} · 第 {event.sourceLine} 行</p>
+              </div></td></tr>}
+            </Fragment>;
+          })}</tbody>
+        </table>
+      </div>
+      <p className="call-ledger-note">每行是一条可辨识调用，不等同于一次用户提问。费用为估算；— 表示未记录或费率未知。输出已包含可计费推理，缓存不重复相加。</p>
+    </section>;
   }
 
   function renderOverview() {
+    const sessions = [...overviewAnalysis.sessions].sort((left, right) =>
+      (Date.parse(right.lastDataAt ?? '') || 0) - (Date.parse(left.lastDataAt ?? '') || 0));
+    const overviewTotal = displayCost(overviewAnalysis.cost, currency);
+    const overviewCandidate = displayCost(overviewAnalysis.candidateCost, currency);
+    const unit = overviewAnalysis.cost[currency] !== undefined ? currency : currency === 'usd' ? 'credits' : 'usd';
+    const percent = overviewAnalysis.cost[unit] ? Math.round((overviewAnalysis.candidateCost[unit] ?? 0) / overviewAnalysis.cost[unit]! * 100) : 0;
     const allocationParts = allocation.map((item) => item.percent).reduce<number[]>((parts, percent) => [...parts, (parts.at(-1) ?? 0) + percent], []);
-    const donut = allocationParts.length ? allocation.map((item, index) => { const start = index === 0 ? 0 : allocationParts[index - 1]; return BEHAVIOR_COLORS[item.key] + ' ' + String(start) + '% ' + String(allocationParts[index]) + '%'; }).join(', ') : '#273022 0% 100%';
-    return <><section className="metrics-grid"><MetricCard label="预估总费用" value={totalCost.value} caption={metricSubtext(analysis.cost)} icon="◈" /><MetricCard label="总 Token 用量" value={formatTokenCount(analysis.usage.totalTokens)} caption={String(analysis.calls.length) + ' 个可辨识模型调用'} icon="◎" /><MetricCard label="疑似可优化费用" value={candidateCost.value} caption={String(candidatePercent) + '% 的已知费用值得检查'} icon="↗" accent /><MetricCard label="已分析会话" value={String(visibleSessions.length)} caption={completenessLabel(analysis) + ' · ' + sourceLabel} icon="▤" /></section><section className="charts-grid"><article className="panel trend-panel"><div className="panel-heading"><div><h2>消耗趋势</h2><p>基于已记录用量，不代表逐 Token 实时扣费</p></div><div className="chart-toggle" role="group" aria-label="趋势单位"><button className={trendMetric === 'usd' ? 'selected' : ''} onClick={() => setTrendMetric('usd')}>费用</button><button className={trendMetric === 'tokens' ? 'selected' : ''} onClick={() => setTrendMetric('tokens')}>Tokens</button><button className={trendMetric === 'credits' ? 'selected' : ''} onClick={() => setTrendMetric('credits')}>Credits</button></div></div><div className="chart-legend"><span><i className="legend-work" />已记录用量</span><span><i className="legend-suspect" />包含异常关联</span><span className="chart-unit">{trendMetric === 'tokens' ? 'tokens' : trendMetric === 'credits' ? 'credits' : 'USD'}</span></div>{trend.length ? <div className="bar-chart" aria-label="最近数据日消耗趋势"><div className="bar-grid"><i /><i /><i /><i /><i /></div><div className="bar-series">{trend.map((item) => <div className="bar-column-wrap" key={item.key} title={item.key + ' · ' + formatTokenCount(item.usage)}><div className="bar-column" style={{ height: item.height + '%' }}><span className="bar-suspect" style={{ height: Math.min(70, Math.max(16, item.cost.complete ? 22 : 40)) + '%' }} /><span className="bar-work" /></div><small>{item.key.slice(5).replace('-', '/')}</small></div>)}</div></div> : <EmptyState title="没有可绘制的时间" description="来源缺少时间戳，趋势会保留为空。" />}<div className="chart-footnote"><span className="status-dot" />最后数据：{formatRelativeTime(analysis.lastDataAt)}<button className="text-button" onClick={() => setView('sessions')}>查看每轮明细 ↗</button></div></article><article className="panel allocation-panel"><div className="panel-heading"><div><h2>Token 花在哪里？</h2><p>按行为归因，不等同于服务商账单分类</p></div><span className="info-icon" title="行为归因可能包含推断">i</span></div><div className="allocation-content"><div className="donut" style={{ background: 'conic-gradient(' + donut + ')' }}><div><span>总用量</span><strong>{formatTokenCount(analysis.usage.totalTokens)}</strong><span>tokens</span></div></div><div className="allocation-legend">{allocation.map((item) => <div key={item.key}><span><i style={{ background: BEHAVIOR_COLORS[item.key] }} />{item.label}</span><strong>{item.percent}<small>%</small></strong></div>)}</div></div><div className="allocation-note">{analysis.completeness === 'complete' ? '当前分析范围内可确认' : '部分记录缺失，百分比可能不完整'}</div></article></section><section className="section-block"><div className="section-heading"><h2><span className="section-icon amber">⌁</span> 值得关注 <span className="count-badge">{navAnomalyCount} 类异常</span></h2><button className="text-button" onClick={() => setView('insights')}>查看全部洞察 ↗</button></div>{visibleAnomalies.length ? <div className="insight-grid">{visibleAnomalies.slice(0, 3).map((anomaly) => <AnomalyCard key={anomaly.id} anomaly={anomaly} analysis={analysis} currency={currency} onToggleNecessary={toggleNecessary} onSelect={() => { setSelectedAnomalyId(anomaly.id); setView('insights'); }} selected={selectedAnomalyId === anomaly.id} />)}</div> : <div className="panel"><EmptyState title="暂无已确认异常" description="满足完整证据条件的重复读取、轮询或压缩循环会在这里出现。" /></div>}</section><section className="panel sessions-panel"><div className="panel-heading"><div className="inline-heading"><h2>最近会话</h2><span className="count-badge">{visibleSessions.length}</span></div><button className="text-button" onClick={() => setView('sessions')}>查看所有会话 ↗</button></div><div className="table-wrap"><table><thead><tr><th>任务 / Session</th><th>Agent</th><th>Token 用量</th><th>预估费用</th><th>可优化占比</th><th>状态</th></tr></thead>{renderSessionRows()}</table></div></section></>;
+    const donut = overviewAnalysis.usage.totalTokens > 0 ? allocation.map((item, index) => { const start = index === 0 ? 0 : allocationParts[index - 1]; return BEHAVIOR_COLORS[item.key] + ' ' + String(start) + '% ' + String(allocationParts[index]) + '%'; }).join(', ') : '#273022 0% 100%';
+    return <><div className="session-date-filter overview-date-filter">
+      <div className="segmented" role="group" aria-label="总览日期筛选">
+        {[...SESSION_TIME_RANGES.slice(1), SESSION_TIME_RANGES[0]].map((range) => <button key={range.value} className={overviewTimeRange === range.value ? 'selected' : ''} aria-pressed={overviewTimeRange === range.value} onClick={() => { setOverviewTimeRange(range.value); setOverviewRangeNow(Date.now()); }}>{range.label}</button>)}
+      </div>
+      <p>按调用记录时间统计所选范围内的消耗，1 天为过去 24 小时；实时范围每分钟更新。{overviewTimeRange !== 'all' && '无有效时间的调用及整会话汇总费用不计入；进入会话详情可查看完整历史。'}</p>
+    </div><section className="metrics-grid"><MetricCard label="预估总费用" value={overviewTotal.value} caption={metricSubtext(overviewAnalysis.cost)} icon="◈" /><MetricCard label="总 Token 用量" value={formatTokenCount(overviewAnalysis.usage.totalTokens)} caption={String(overviewAnalysis.calls.length) + ' 个可辨识模型调用'} icon="◎" /><MetricCard label="疑似可优化费用" value={overviewCandidate.value} caption={String(percent) + '% 的已知费用值得检查'} icon="↗" accent /><MetricCard label="已分析会话" value={String(sessions.length)} caption={completenessLabel(overviewAnalysis) + ' · ' + sourceLabel} icon="▤" /></section><section className="charts-grid"><article className="panel trend-panel"><div className="panel-heading"><div><h2>消耗趋势</h2><p>所选范围 · 本地时间 · 基于已记录用量，未知费用不绘制</p></div><div className="chart-toggle" role="group" aria-label="趋势单位"><button className={trendMetric === 'usd' ? 'selected' : ''} onClick={() => setTrendMetric('usd')}>费用</button><button className={trendMetric === 'tokens' ? 'selected' : ''} onClick={() => setTrendMetric('tokens')}>Tokens</button><button className={trendMetric === 'credits' ? 'selected' : ''} onClick={() => setTrendMetric('credits')}>Credits</button></div></div><div className="chart-legend"><span><i className="legend-work" />已记录用量</span><span><i className="legend-suspect" />包含异常关联</span><span className="chart-unit">{trendMetric === 'tokens' ? 'tokens' : trendMetric === 'credits' ? 'credits' : 'USD'}</span></div>{trend.some((item) => trendMetric === 'tokens' || item.cost[trendMetric] !== undefined) ? <div className="bar-chart" aria-label="所选时间范围消耗趋势"><div className="bar-grid"><i /><i /><i /><i /><i /></div><div className="bar-series" style={{ minWidth: trend.length * 38 }}>{trend.map((item) => <div className="bar-column-wrap" key={item.key} title={item.key + ' · ' + formatTokenCount(item.usage)}><div className="bar-column" style={{ height: item.height + '%', minHeight: 0 }}><span className="bar-suspect" style={{ height: item.suspectHeight + '%' }} /><span className="bar-work" /></div><small>{item.label}</small></div>)}</div></div> : <EmptyState title="当前范围暂无可绘制数据" description="可切换 Tokens、延长时间范围或检查适用费率；未知费用不按零费用或 Credits 替代。" />}<div className="chart-footnote"><span className="status-dot" />最后数据：{formatRelativeTime(overviewAnalysis.lastDataAt)}<button className="text-button" onClick={() => setView('sessions')}>查看每轮明细 ↗</button></div></article><article className="panel allocation-panel"><div className="panel-heading"><div><h2>Token 花在哪里？</h2><p>按行为归因，不等同于服务商账单分类</p></div><span className="info-icon" title="行为归因可能包含推断">i</span></div><div className="allocation-content"><div className="donut" style={{ background: 'conic-gradient(' + donut + ')' }}><div><span>总用量</span><strong>{formatTokenCount(overviewAnalysis.usage.totalTokens)}</strong><span>tokens</span></div></div><div className="allocation-legend">{allocation.map((item) => <div key={item.key}><span><i style={{ background: BEHAVIOR_COLORS[item.key] }} />{item.label}</span><strong>{item.percent}<small>%</small></strong></div>)}</div></div><div className="allocation-note">{overviewAnalysis.completeness === 'complete' ? '当前分析范围内可确认' : '部分记录缺失，百分比可能不完整'}</div></article></section><section className="section-block"><div className="section-heading"><h2><span className="section-icon amber">⌁</span> 值得关注 <span className="count-badge">{overviewAnalysis.anomalies.length} 类异常</span></h2><button className="text-button" onClick={() => setView('insights')}>查看全部洞察 ↗</button></div>{overviewAnalysis.anomalies.length ? <div className="insight-grid">{overviewAnalysis.anomalies.slice(0, 3).map((anomaly) => <AnomalyCard key={anomaly.id} anomaly={anomaly} analysis={overviewAnalysis} currency={currency} onToggleNecessary={toggleNecessary} onSelect={() => { setSelectedAnomalyId(anomaly.id); setView('insights'); }} selected={selectedAnomalyId === anomaly.id} />)}</div> : <div className="panel"><EmptyState title="暂无已确认异常" description="满足完整证据条件的重复读取、轮询或压缩循环会在这里出现。" /></div>}</section><section className="panel sessions-panel"><div className="panel-heading"><div className="inline-heading"><h2>范围内最近会话</h2><span className="count-badge">{sessions.length}</span></div><button className="text-button" onClick={() => { setSelectedSessionId(null); setView('sessions'); }}>查看所有会话 ↗</button></div>{renderSessionRows(sessions)}</section></>;
   }
 
   function renderSessionsView() {
-    return <section className="view-stack"><div className="view-intro"><div><span className="eyebrow">SESSION LEDGER</span><h2>会话记录</h2><p>逐个分析单元查看模型调用、自身用量和含子会话合计。</p></div><div className="view-intro-actions"><div className="inline-summary"><span>{visibleSessions.length} 个会话</span><span>{formatTokenCount(analysis.usage.totalTokens)} tokens</span><span>{completenessLabel(analysis)}</span></div><label className="sort-control">排序<select aria-label="会话排序" value={sessionSort} onChange={(event) => setSessionSort(event.target.value as SessionSort)}><option value="updated">最近数据</option><option value="tokens">含子会话 Token</option><option value="cost">可计价费用</option><option value="growth">最近增速</option></select></label></div></div><div className="panel sessions-panel full-table"><div className="panel-heading"><div className="inline-heading"><h2>分析单元</h2><span className="count-badge">{visibleSessions.length}</span></div><span className="panel-hint">点击任务查看时间线和成本树</span></div><div className="table-wrap"><table><thead><tr><th>任务 / Session</th><th>Agent</th><th>自身 Token</th><th>含子会话</th><th>费用</th><th>最近数据</th></tr></thead><tbody>{visibleSessions.length ? visibleSessions.map((session) => { const cost = displayCost(session.inclusiveCost, currency); return <tr key={session.id} className={selectedSessionId === session.id ? 'row-selected' : ''}><td><button className="session-link" onClick={() => setSelectedSessionId(session.id)}><strong>{session.title}</strong><small>{session.id}</small></button></td><td><SourceBadge provider={session.provider} /></td><td className="mono">{formatTokenCount(session.ownUsage.totalTokens)}</td><td className="mono">{formatTokenCount(session.inclusiveUsage.totalTokens)}</td><td className={'mono cost-' + cost.tone}>{cost.value}<small>{cost.note}</small></td><td>{formatRelativeTime(session.lastDataAt)}</td></tr>; }) : <tr><td colSpan={6}><EmptyState title="还没有会话" description="从右上角导入日志，或选择一个目录开始实时采集。" /></td></tr>}</tbody></table></div></div><div className="detail-grid"><article className="panel detail-panel"><div className="panel-heading"><div><h2>{selectedSession ? selectedSession.title : '选择一个会话'}</h2><p>{selectedSession ? selectedSession.id : '时间线会显示在这里'}</p></div></div>{selectedSession ? <><div className="detail-stats"><div><span>自身用量</span><strong>{formatTokenCount(selectedSession.ownUsage.totalTokens)}</strong></div><div><span>含子会话</span><strong>{formatTokenCount(selectedSession.inclusiveUsage.totalTokens)}</strong></div><div><span>费用</span><strong>{displayCost(selectedSession.inclusiveCost, currency).value}</strong></div></div><div className="timeline-wrap">{renderTimeline(selectedSession.id)}</div></> : <EmptyState title="尚未选择分析单元" description="点击上方任意会话以查看模型调用与证据。" />}</article><article className="panel detail-panel"><div className="panel-heading"><div><h2>异常证据</h2><p>只显示与当前会话有关的可疑模式</p></div></div>{selectedSession ? <div className="compact-anomalies">{visibleAnomalies.filter((anomaly) => anomaly.sessionId === selectedSession.id).map((anomaly) => <AnomalyCard key={anomaly.id} anomaly={anomaly} analysis={analysis} currency={currency} onToggleNecessary={toggleNecessary} onSelect={() => setSelectedAnomalyId(anomaly.id)} selected={selectedAnomalyId === anomaly.id} />)}{!visibleAnomalies.some((anomaly) => anomaly.sessionId === selectedSession.id) && <EmptyState title="暂无异常证据" description="正常工作、证据不足或数据不完整都不会被强行标记。" />}</div> : <EmptyState title="选择会话后查看" description="证据会链接回具体调用和来源记录。" />}</article></div></section>;
+    const filteredSessions = sessionsInTimeRange(visibleSessions, sessionTimeRange, sessionRangeNow);
+    const page = paginate(filteredSessions, sessionPage, 15);
+    if (!selectedSession) return <section className="view-stack">
+      <div className="view-intro">
+        <div><span className="eyebrow">SESSION LEDGER</span><h2>会话记录</h2><p>每页 15 个会话 · 点击名称进入详情，返回时保留页码。</p></div>
+        <label className="sort-control">排序<select aria-label="会话排序" value={sessionSort} onChange={(event) => { setSessionSort(event.target.value as SessionSort); setSessionPage(1); setSubagentPage(1); }}>
+          <option value="updated">最近数据</option><option value="tokens">含子会话 Token</option><option value="cost">可计价费用</option><option value="growth">最近增速</option>
+        </select></label>
+      </div>
+      <div className="session-date-filter">
+        <div className="segmented" role="group" aria-label="会话日期筛选">
+          {SESSION_TIME_RANGES.map((range) => <button key={range.value} className={sessionTimeRange === range.value ? 'selected' : ''} aria-pressed={sessionTimeRange === range.value} onClick={() => { setSessionTimeRange(range.value); setSessionRangeNow(Date.now()); setSessionPage(1); }}>{range.label}</button>)}
+        </div>
+        <p>按最后记录时间筛选，1 天为过去 24 小时；每分钟更新范围，不裁剪会话用量。</p>
+      </div>
+      <div className="panel sessions-panel">
+        <Pagination {...page} onChange={setSessionPage} label="会话列表分页" />
+        {page.items.length || sessionTimeRange === 'all' ? renderSessionTable(page.items) : <EmptyState title="当前时间范围内没有会话" description="请选择更长的时间范围或“全部”。没有有效时间的会话仅在“全部”中显示。" />}
+      </div>
+    </section>;
+
+    const children = analysis.sessions.filter((session) => session.parentSessionId === selectedSession.id && session.provider === selectedSession.provider);
+    const childRows = paginate(children, childPage, 15);
+    const anomalies = visibleAnomalies.filter((anomaly) => anomaly.sessionId === selectedSession.id);
+    return <section className="view-stack session-detail">
+      <button className="text-button back-to-sessions" onClick={() => { setSelectedSessionId(null); window.scrollTo({ top: 0 }); }}>← 返回会话列表（第 {page.page} 页）</button>
+      <article className="panel detail-panel">
+        <div className="panel-heading session-detail-heading">
+          <div><span className="eyebrow">SESSION DETAIL</span><h2 title={sessionDisplayName(selectedSession)}>{sessionDisplayName(selectedSession)}</h2>
+            <details className="session-metadata"><summary>会话信息 · {selectedSession.id.slice(0, 8)}</summary>
+              <div><p>{selectedSession.title === selectedSession.id ? '未命名会话' : selectedSession.title}</p><p>目录：{selectedSession.cwd || '来源未记录'}</p><p>ID：{selectedSession.id}</p></div>
+            </details>
+          </div><SourceBadge provider={selectedSession.provider} />
+        </div>
+        <div className="detail-stats">
+          <div><span>自身 Token</span><strong>{formatTokenCount(selectedSession.ownUsage.totalTokens)}</strong></div>
+          <div><span>含子会话 Token</span><strong>{formatTokenCount(selectedSession.inclusiveUsage.totalTokens)}</strong></div>
+          <div><span>预估费用 · 含子会话</span><strong>{displayCost(selectedSession.inclusiveCost, currency).value}</strong><small>{displayCost(selectedSession.inclusiveCost, currency).note}</small></div>
+        </div>
+        <div className="detail-navigation" role="group" aria-label="会话详情分区">
+          <button aria-pressed={detailSection === 'summary'} onClick={() => setDetailSection('summary')}>概览</button>
+          <button aria-pressed={detailSection === 'calls'} onClick={() => setDetailSection('calls')}>调用明细</button>
+          <button aria-pressed={detailSection === 'context'} onClick={() => setDetailSection('context')}>Tools / Skills 上下文</button>
+          <button aria-pressed={detailSection === 'children'} onClick={() => setDetailSection('children')}>子会话 ({children.length})</button>
+          <button aria-pressed={detailSection === 'evidence'} onClick={() => setDetailSection('evidence')}>异常证据 ({anomalies.length})</button>
+        </div>
+        {detailSection === 'summary' && <div className="detail-summary">
+          <SessionCostTree session={selectedSession} childSessions={children} rates={rates} currency={currency} />
+          <p className="detail-note">行为归因仅用于解释自身消耗，不代表每项都能优化。含子会话合计不可再与子会话明细相加。</p>
+        </div>}
+        {detailSection === 'context' && <SessionContextPanel key={selectedSession.id} inventory={contextInventories.get(contextSessionKey(selectedSession.provider, selectedSession.id))} category={contextCategory} onCategory={setContextCategory} />}
+        {detailSection === 'calls' && <div className="timeline-wrap">
+          <div className="timeline-controls"><span>仅当前会话 · 最新记录在前 · 每页 20 条</span>
+            <label className="sort-control">类型<select aria-label="明细事件类型" value={timelineScope} onChange={(event) => { setTimelineScope(event.target.value as 'model' | 'all'); setTimelinePage(1); setExpandedCallId(null); }}>
+              <option value="model">模型调用</option><option value="all">全部事件</option>
+            </select></label>
+          </div>{renderCallDetails(selectedSession.id)}
+        </div>}
+        {detailSection === 'children' && <div className="sessions-panel">
+          <Pagination {...childRows} onChange={setChildPage} label="直属子会话分页" />
+          {children.length ? renderSessionTable(childRows.items) : <EmptyState title="没有直属子会话" description="仅展示日志中有明确归属记录的子会话。" />}
+        </div>}
+        {detailSection === 'evidence' && <div className="compact-anomalies detail-scroll">
+          {anomalies.map((anomaly) => <AnomalyCard key={anomaly.id} anomaly={anomaly} analysis={analysis} currency={currency} onToggleNecessary={toggleNecessary} onSelect={() => setSelectedAnomalyId(anomaly.id)} selected={selectedAnomalyId === anomaly.id} />)}
+          {!anomalies.length && <EmptyState title="暂无异常证据" description="正常工作、证据不足或数据不完整都不会被强行标记。" />}
+        </div>}
+      </article>
+    </section>;
   }
 
   function renderInsightsView() {
@@ -678,7 +1071,12 @@ export default function Home() {
 
   function renderSubagentsView() {
     const children = visibleSessions.filter((session) => session.parentSessionId);
-    return <section className="view-stack"><div className="view-intro"><div><span className="eyebrow">CHILD SESSION TREE</span><h2>子 Agent</h2><p>只按明确归属证据展示子会话，目录相同或时间接近不会自动合并。</p></div><div className="inline-summary"><span>{children.length} 个已发现子会话</span><span>缺失日志会显示缺口</span></div></div><div className="panel sessions-panel full-table"><div className="panel-heading"><div className="inline-heading"><h2>主子会话成本树</h2><span className="count-badge">{children.length}</span></div></div><div className="table-wrap"><table><thead><tr><th>执行主体</th><th>归属</th><th>自身 Token</th><th>含下级</th><th>费用</th><th>完整性</th></tr></thead><tbody>{children.length ? children.map((session) => { const cost = displayCost(session.inclusiveCost, currency); const parent = visibleSessions.find((item) => item.id === session.parentSessionId); return <tr key={session.id}><td><div className="session-name-cell child-session"><span className="tree-branch">└</span><button className="session-link" onClick={() => setSelectedSessionId(session.id)}><strong>{session.title}</strong><small>{session.id}</small></button></div></td><td>{parent ? parent.title : '归属未知'}</td><td className="mono">{formatTokenCount(session.ownUsage.totalTokens)}</td><td className="mono">{formatTokenCount(session.inclusiveUsage.totalTokens)}</td><td className={'mono cost-' + cost.tone}>{cost.value}<small>{cost.note}</small></td><td><span className={'integrity-pill integrity-' + session.completeness}>{session.completeness === 'complete' ? '完整' : '有缺口'}</span></td></tr>; }) : <tr><td colSpan={6}><EmptyState title="尚未发现子会话" description="父子关系需要来源中的明确归属证据；没有可靠分母时不会显示覆盖率。" /></td></tr>}</tbody></table></div></div><div className="panel callout-panel"><span className="callout-icon">i</span><div><strong>自身用量与含子会话合计是两个视图</strong><p>含子会话的费用不能再与子会话明细相加。来源只提供整树汇总时，页面会保留汇总但不虚构子节点。</p></div></div></section>;
+    const page = paginate(children, subagentPage, 15);
+    return <section className="view-stack">
+      <div className="view-intro"><div><span className="eyebrow">CHILD SESSIONS</span><h2>子 Agent</h2><p>每页 15 个子会话。仅按明确归属证据展示，不按目录或时间猜测关系。</p></div></div>
+      <div className="panel sessions-panel"><Pagination {...page} onChange={setSubagentPage} label="子 Agent 分页" />{renderSessionTable(page.items)}</div>
+      <div className="panel callout-panel"><span className="callout-icon">i</span><div><strong>自身用量与含子会话合计是两个视图</strong><p>含子会话的费用不能再与子会话明细相加。</p></div></div>
+    </section>;
   }
 
   function renderSettingsView() {
@@ -712,5 +1110,5 @@ export default function Home() {
     return <section className="view-stack"><div className="view-intro"><div><span className="eyebrow">LOCAL PREFERENCES</span><h2>计费与规则</h2><p>费用是基于已记录用量和适用费率的估算，不是官方账单。</p></div><div className="currency-switch" role="group" aria-label="默认货币单位"><button className={currency === 'usd' ? 'selected' : ''} onClick={() => setCurrencyAndSave('usd')}>USD</button><button className={currency === 'credits' ? 'selected' : ''} onClick={() => setCurrencyAndSave('credits')}>Credits</button></div></div><div className="settings-grid"><article className="panel settings-panel"><div className="panel-heading"><div><h2>费率快照</h2><p>官方快照与用户自定义依据分开显示</p></div></div><div className="rate-list">{allRates.map((rate) => <div className="rate-row" key={rate.id}><div><SourceBadge provider={rate.provider} /><strong>{rate.modelPattern}</strong><small>{rate.source} · 核对于 {rate.checkedDate}</small></div><div className="rate-values">{rate.inputUsdPerMillion !== undefined && <span>{'$' + String(rate.inputUsdPerMillion)}/M input</span>}{rate.inputCreditsPerMillion !== undefined && <span>{rate.inputCreditsPerMillion} credits/M input</span>}<small>{rate.kind === 'custom' ? '自定义' : '官方快照'}</small></div>{rate.kind === 'custom' && <button className="icon-button" onClick={() => setPreferences((current) => ({ ...current, customRates: current.customRates.filter((item) => item.id !== rate.id) }))} aria-label={'删除 ' + rate.modelPattern}>×</button>}</div>)}{!allRates.length && <EmptyState title="暂无费率" description="未知费率仍可查看 Token 和异常证据。" />}</div></article><article className="panel settings-panel"><div className="panel-heading"><div><h2>添加自定义费率</h2><p>金额按每百万 Token 录入</p></div></div><form className="rate-form" onSubmit={addRate}><label>来源<select value={rateDraft.provider} onChange={(event) => setRateDraft((current) => ({ ...current, provider: event.target.value as Provider }))}><option value="codex">Codex</option><option value="claude">Claude Code</option><option value="unknown">未知来源</option></select></label><label>模型匹配<input value={rateDraft.modelPattern} onChange={(event) => setRateDraft((current) => ({ ...current, modelPattern: event.target.value }))} placeholder="例如 claude-sonnet-4 或 *" /></label><label>单位<select value={rateDraft.unit} onChange={(event) => setRateDraft((current) => ({ ...current, unit: event.target.value as Currency }))}><option value="usd">USD / M</option><option value="credits">Credits / M</option></select></label><div className="rate-input-grid"><label>输入<input inputMode="decimal" value={rateDraft.input} onChange={(event) => setRateDraft((current) => ({ ...current, input: event.target.value }))} placeholder="1.00" /></label><label>缓存输入<input inputMode="decimal" value={rateDraft.cached} onChange={(event) => setRateDraft((current) => ({ ...current, cached: event.target.value }))} placeholder="0.10" /></label><label>输出<input inputMode="decimal" value={rateDraft.output} onChange={(event) => setRateDraft((current) => ({ ...current, output: event.target.value }))} placeholder="5.00" /></label></div><label>依据说明<input value={rateDraft.source} onChange={(event) => setRateDraft((current) => ({ ...current, source: event.target.value }))} /></label><button className="button primary full-button" type="submit">保存费率</button></form></article></div><div className="settings-grid"><article className="panel settings-panel"><div className="panel-heading"><div><h2>初始异常规则</h2><p>规则命中代表值得检查，不代表已经证明浪费</p></div></div><div className="rule-list"><div><span className="rule-number">01</span><div><strong>疑似重复读取</strong><p>同一主体、文件、范围与内容，5 分钟内至少 3 次。</p></div></div><div><span className="rule-number">02</span><div><strong>疑似轮询空转</strong><p>同一目标连续 3 次纯 wait/poll，间隔不超过 60 秒且无状态变化。</p></div></div><div><span className="rule-number">03</span><div><strong>疑似压缩循环</strong><p>10 分钟内至少两轮“压缩 → 重读相同内容”。</p></div></div></div></article><article className="panel settings-panel privacy-panel"><div className="privacy-large-icon">◇</div><h2>本地优先</h2><p>原始日志只在设备内读取与分析。关闭网页不会停止本地服务；停止采集会保留当前结果，清除会话才会丢弃临时内容。</p><div className="service-actions"><span className="service-state"><i />{collectorMessage}</span><button className="button secondary" onClick={clearSession}>清除本次数据</button></div></article></div><article className="panel compatibility-panel"><div className="panel-heading"><div><h2>解析范围与证据边界</h2><p>支持声明只覆盖已实现的通用字段；实际日志版本仍需样本验证。</p></div><span className="count-badge">本地只读</span></div><div className="compatibility-grid"><div><strong>Codex JSONL</strong><p>识别 token_count 累计快照、function_call / output、用户请求、父会话和常见文件范围。</p></div><div><strong>Claude Code JSONL</strong><p>识别 assistant usage、tool_use / tool_result、result 汇总、缓存字段和上下文压缩标记。</p></div><div><strong>缺失与未知</strong><p>坏行、截断输出、未匹配费率或无法确认归属会保留证据并标为部分/未知，不静默填零。</p></div></div></article></section>;
   }
 
-  return <div className="app-shell"><aside className="sidebar"><Link className="brand" href="/" aria-label="TokenScope 首页"><span className="brand-symbol">t</span><span className="brand-name">tokenscope</span><span className="brand-dot">.</span></Link><div className="workspace-switch"><span className="workspace-icon">W</span><div><strong>我的工作空间</strong><small>Local workspace</small></div><span className="muted">⌄</span></div><div className="nav-label">工作空间</div><nav aria-label="主导航">{NAV_ITEMS.map((item) => <button key={item.id} className={'nav-item ' + (view === item.id ? 'active' : '')} onClick={() => setView(item.id)}><span className="nav-glyph" aria-hidden="true">{item.icon}</span>{item.label}{item.id === 'insights' && navAnomalyCount > 0 && <span className="nav-count">{navAnomalyCount}</span>}</button>)}</nav><div className="nav-label nav-label-settings">偏好设置</div><button className={'nav-item ' + (view === 'settings' ? 'active' : '')} onClick={() => setView('settings')}><span className="nav-glyph" aria-hidden="true">⚙</span>计费与规则</button><div className="sidebar-bottom"><div className="privacy-note"><span className="privacy-icon">◇</span><strong>你的代码，只属于你</strong><p>会话在浏览器本地分析。<br />不上传日志，不需要 API Key。</p><span className="local-status"><i />本地优先 · 隐私安全</span></div><div className="sidebar-footer"><span>TokenScope</span><span>v0.2.0</span></div></div></aside><div className="main-shell"><header className="topbar"><div className="breadcrumbs">工作空间 <span>/</span><strong>{NAV_ITEMS.find((item) => item.id === view)?.label ?? '计费与规则'}</strong></div><div className="topbar-right"><span className={'data-mode mode-' + analysisMode}><i />{modeLabel}</span><span className="topbar-divider" /><span className="collector-state"><i className={collectorStatus === 'collecting' ? 'pulse' : ''} />{collectorStatus === 'collecting' ? '采集中' : collectorStatus === 'stopped' ? '已停止' : collectorStatus === 'error' ? '需检查' : '本地服务'}</span><span className="avatar">W</span></div></header><main className="main-content"><div className="page-heading"><div><div className="eyebrow">LESS WASTE. MORE BUILDING.</div><h1>{view === 'overview' ? '成本总览' : NAV_ITEMS.find((item) => item.id === view)?.label ?? '计费与规则'}<span className="heading-dot">.</span></h1><p>{view === 'overview' ? '看清每一枚 Token 的去向，把预算花在真正的工作上。' : '保留记录、估算和证据，让每个判断都能回到原始会话。'}</p></div><div className="heading-actions"><button className="button secondary" onClick={analysisMode === 'live' && collectorStatus === 'collecting' ? stopCollection : handleDirectory} disabled={collectorStatus === 'loading'}>{analysisMode === 'live' && collectorStatus === 'collecting' ? '■ 停止采集' : '◉ 选择日志目录'}</button><button className="button primary" onClick={() => fileInputRef.current?.click()} disabled={collectorStatus === 'loading'}>＋ 导入 Session</button><input ref={fileInputRef} className="visually-hidden" type="file" accept=".jsonl,.json,.ndjson,.log" multiple onChange={(event) => { if (event.target.files) void handleFiles(event.target.files); event.currentTarget.value = ''; }} /></div></div><div className="filter-row"><div className="segmented" role="group" aria-label="Agent 筛选"><button className={providerFilter === 'all' ? 'selected' : ''} onClick={() => setProviderFilter('all')}>全部 Agent</button><button className={providerFilter === 'codex' ? 'selected' : ''} onClick={() => setProviderFilter('codex')}>Codex</button><button className={providerFilter === 'claude' ? 'selected' : ''} onClick={() => setProviderFilter('claude')}>Claude Code</button></div><div className="data-caption"><span className={'status-dot status-' + collectorStatus} />{collectorMessage}<span>·</span>最后数据 {formatRelativeTime(analysis.lastDataAt)}</div></div>{analysis.errors.length > 0 && <div className="warning-banner"><span>!</span><div><strong>部分来源未能完整解析</strong><p>{analysis.errors.length} 条记录被隔离；已知小计仍可查看，未知内容不会被填成零。</p><details className="error-details"><summary>查看受影响记录</summary><ul>{analysis.errors.slice(0, 8).map((error, index) => <li key={(error.sourceFile ?? 'error') + error.line + String(index)}>{error.sourceFile ?? '来源未知'} · {error.line > 0 ? '第 ' + String(error.line) + ' 行' : '文件级'} · {error.message}</li>)}</ul>{analysis.errors.length > 8 && <small>其余 {analysis.errors.length - 8} 条错误已折叠。</small>}</details></div><button onClick={() => setView('sessions')}>查看会话 ↗</button></div>}{view === 'overview' && renderOverview()}{view === 'sessions' && renderSessionsView()}{view === 'insights' && renderInsightsView()}{view === 'subagents' && renderSubagentsView()}{view === 'settings' && renderSettingsView()}<footer className="page-footer"><span><i className="tiny-dot" />所有数据仅在本地处理</span><span>{analysisMode === 'demo' ? '演示数据 · 合成费率' : '费用为估算 · 数据不代表真实账单'}</span><span>{liveSupported ? '目录实时采集可用' : '当前浏览器请使用文件导入'}</span></footer></main></div></div>;
+  return <div className="app-shell"><aside className="sidebar"><Link className="brand" href="/" aria-label="TokenScope 首页"><span className="brand-symbol">t</span><span className="brand-name">tokenscope</span><span className="brand-dot">.</span></Link><div className="workspace-switch"><span className="workspace-icon">W</span><div><strong>我的工作空间</strong><small>Local workspace</small></div><span className="muted">⌄</span></div><div className="nav-label">工作空间</div><nav aria-label="主导航">{NAV_ITEMS.map((item) => <button key={item.id} className={'nav-item ' + (view === item.id ? 'active' : '')} onClick={() => { setView(item.id); if (item.id === 'sessions') setSelectedSessionId(null); }}><span className="nav-glyph" aria-hidden="true">{item.icon}</span>{item.label}{item.id === 'insights' && navAnomalyCount > 0 && <span className="nav-count">{navAnomalyCount}</span>}</button>)}</nav><div className="nav-label nav-label-settings">偏好设置</div><button className={'nav-item ' + (view === 'settings' ? 'active' : '')} onClick={() => setView('settings')}><span className="nav-glyph" aria-hidden="true">⚙</span>计费与规则</button><div className="sidebar-bottom"><div className="privacy-note"><span className="privacy-icon">◇</span><strong>你的代码，只属于你</strong><p>会话在浏览器本地分析。<br />不上传日志，不需要 API Key。</p><span className="local-status"><i />本地优先 · 隐私安全</span></div><div className="sidebar-footer"><span>TokenScope</span><span>v0.2.0</span></div></div></aside><div className="main-shell"><header className="topbar"><div className="breadcrumbs">工作空间 <span>/</span><strong>{NAV_ITEMS.find((item) => item.id === view)?.label ?? '计费与规则'}</strong></div><div className="topbar-right"><span className={'data-mode mode-' + analysisMode}><i />{modeLabel}</span><span className="topbar-divider" /><span className="collector-state"><i className={collectorStatus === 'collecting' ? 'pulse' : ''} />{collectorStatus === 'collecting' ? '采集中' : collectorStatus === 'stopped' ? '已停止' : collectorStatus === 'error' ? '需检查' : '本地服务'}</span><span className="avatar">W</span></div></header><main className="main-content"><div className="page-heading"><div><div className="eyebrow">LESS WASTE. MORE BUILDING.</div><h1>{view === 'overview' ? '成本总览' : NAV_ITEMS.find((item) => item.id === view)?.label ?? '计费与规则'}<span className="heading-dot">.</span></h1><p>{view === 'overview' ? '看清每一枚 Token 的去向，把预算花在真正的工作上。' : '保留记录、估算和证据，让每个判断都能回到原始会话。'}</p></div><div className="heading-actions"><input className="path-input" value={livePath} onChange={(event) => setLivePath(event.target.value)} placeholder="~/.codex（含 sessions 与 archived_sessions）或 Claude 日志目录" aria-label="本机日志目录路径" /><button className="button secondary" onClick={analysisMode === 'live' && collectorStatus === 'collecting' ? stopCollection : handleLiveStart} disabled={collectorStatus === 'loading'}>{analysisMode === 'live' && collectorStatus === 'collecting' ? '■ 停止采集' : '◉ 开始本机采集'}</button><button className="button primary" onClick={() => fileInputRef.current?.click()} disabled={collectorStatus === 'loading'}>＋ 导入 Session</button><input ref={fileInputRef} className="visually-hidden" type="file" accept=".jsonl,.json,.ndjson,.log" multiple onChange={(event) => { if (event.target.files) void handleFiles(event.target.files); event.currentTarget.value = ''; }} /></div></div><div className="filter-row"><div className="segmented" role="group" aria-label="Agent 筛选"><button className={providerFilter === 'all' ? 'selected' : ''} onClick={() => filterProvider('all')}>全部 Agent</button><button className={providerFilter === 'codex' ? 'selected' : ''} onClick={() => filterProvider('codex')}>Codex</button><button className={providerFilter === 'claude' ? 'selected' : ''} onClick={() => filterProvider('claude')}>Claude Code</button></div><div className="data-caption"><span className={'status-dot status-' + collectorStatus} />{collectorMessage}<span>·</span>最后数据 {formatRelativeTime(analysis.lastDataAt)}</div></div>{analysis.errors.length > 0 && <div className="warning-banner"><span>!</span><div><strong>部分来源未能完整解析</strong><p>{analysis.errors.length} 条记录被隔离；已知小计仍可查看，未知内容不会被填成零。</p><details className="error-details"><summary>查看受影响记录</summary><ul>{analysis.errors.slice(0, 8).map((error, index) => <li key={(error.sourceFile ?? 'error') + error.line + String(index)}>{error.sourceFile ?? '来源未知'} · {error.line > 0 ? '第 ' + String(error.line) + ' 行' : '文件级'} · {error.message}</li>)}</ul>{analysis.errors.length > 8 && <small>其余 {analysis.errors.length - 8} 条错误已折叠。</small>}</details></div><button onClick={() => setView('sessions')}>查看会话 ↗</button></div>}{view === 'overview' && renderOverview()}{view === 'sessions' && renderSessionsView()}{view === 'insights' && renderInsightsView()}{view === 'subagents' && renderSubagentsView()}{view === 'settings' && renderSettingsView()}<footer className="page-footer"><span><i className="tiny-dot" />所有数据仅在本地处理</span><span>{analysisMode === 'demo' ? '演示数据 · 合成费率' : '费用为估算 · 数据不代表真实账单'}</span><span>关闭网页不会停止本机采集；退出服务后才清空</span></footer></main></div></div>;
 }
