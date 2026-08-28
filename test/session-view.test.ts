@@ -16,10 +16,12 @@ import {
   eventsForSession,
   findSessionByKey,
   formatGrowthCaption,
+  anomalyBelongsToSession,
   sessionEntryCounts,
   sessionForest,
   sessionGrowthRate,
   sessionIsActive,
+  sessionParentPresent,
   sessionRoleLabel,
   sessionRoots,
   sessionsUnderRoots,
@@ -195,7 +197,8 @@ test('session growth uses a recent window instead of the last two noisy calls', 
   assert.ok(rate !== undefined);
   assert.ok(Math.abs((rate ?? 0) - 1000) < 1e-6);
   assert.equal(formatGrowthRate(undefined), '—');
-  assert.equal(formatGrowthRate(0.4), '<1 / 分钟');
+  assert.equal(formatGrowthRate(0.4), '窗口内 <1 / 分钟');
+  assert.match(formatGrowthRate(1000), /^窗口内 /);
 });
 
 test('ended sessions keep the historical rate but are not presented as current burn', () => {
@@ -212,8 +215,9 @@ test('ended sessions keep the historical rate but are not presented as current b
   assert.equal(sessionIsActive({ lastDataAt: '2026-08-28T11:50:00.000Z' }, now), true);
   const rate = sessionGrowthRate(session);
   assert.ok(rate !== undefined);
+  assert.match(formatGrowthRate(rate), /^窗口内 /);
   assert.equal(formatGrowthRate(rate).includes('当时'), false);
-  assert.match(formatGrowthCaption(rate), /会话末 15 分钟/);
+  assert.match(formatGrowthCaption(rate), /最长 15 分钟/);
   assert.equal(formatGrowthCaption(undefined), '调用不足两条或时间无效');
 });
 
@@ -355,6 +359,18 @@ test('session tree keeps cyclic and self-parent sessions visible as entries', ()
   assert.equal(counts.entries, 2);
 });
 
+test('child slices still see a parent that exists in the full session set', () => {
+  const parent = { id: 'root', provider: 'codex' as const, parentSessionId: undefined };
+  const child = { id: 'child', provider: 'codex' as const, parentSessionId: 'root' };
+  const slice = sessionForest([child]);
+  const full = sessionForest([parent, child]);
+  assert.equal(sessionParentPresent(child, slice.byKey), false);
+  assert.equal(sessionParentPresent(child, full.byKey), true);
+  assert.equal(sessionRoleLabel(child, 0, { parentPresent: sessionParentPresent(child, full.byKey) }), '子会话（循环归属）');
+  assert.equal(sessionRoleLabel(child, 0, { parentPresent: true, childList: true }), '子会话');
+  assert.equal(sessionRoleLabel(child, 1, { parentPresent: true }), '子会话');
+});
+
 test('opening a session uses provider and id so same-id sessions do not collide', () => {
   const codex = { id: 'main', provider: 'codex' as const };
   const claude = { id: 'main', provider: 'claude' as const };
@@ -369,6 +385,8 @@ test('opening a session uses provider and id so same-id sessions do not collide'
   ];
   assert.deepEqual(eventsForSession(events, claude).map((event) => event.id), ['c2']);
   assert.deepEqual(eventsForSession(events, undefined), []);
+  assert.equal(anomalyBelongsToSession({ sessionId: 'main', provider: 'codex' }, codex), true);
+  assert.equal(anomalyBelongsToSession({ sessionId: 'main', provider: 'claude' }, codex), false);
 });
 
 test('session forest is reused for roots, counts, rows and descendants', () => {

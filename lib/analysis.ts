@@ -153,6 +153,7 @@ export interface Anomaly {
   confidence: 'high' | 'medium' | 'low';
   actorId: string;
   sessionId: string;
+  provider: Provider;
   startedAt?: string;
   endedAt?: string;
   callIds: string[];
@@ -1401,7 +1402,7 @@ export function usageTokenCount(usage?: Usage): number {
 
 function addUsage(target: UsageSummary, usage?: Usage): UsageSummary {
   if (!usage) return target;
-  const cached = usage.cachedInputTokens ?? 0;
+  const cached = cachedInputTokens(usage);
   const cacheCreation = usage.cacheCreationInputTokens ?? 0;
   const reasoning = usage.reasoningTokens ?? 0;
   target.inputTokens += usage.inputTokens;
@@ -1773,6 +1774,7 @@ function detectRereads(events: AnalysisEvent[], calls: AnalysisEvent[]): Anomaly
         confidence: exact ? 'high' : 'low',
         actorId: first.actorId,
         sessionId: first.sessionId,
+        provider: first.provider,
         startedAt: first.timestamp,
         endedAt: last.timestamp,
         callIds,
@@ -1840,6 +1842,7 @@ function detectPolls(events: AnalysisEvent[], calls: AnalysisEvent[]): Anomaly[]
         confidence: 'high',
         actorId: first.actorId,
         sessionId: first.sessionId,
+        provider: first.provider,
         startedAt: first.timestamp,
         endedAt: last.timestamp,
         callIds,
@@ -1932,6 +1935,7 @@ function detectCompactionLoops(events: AnalysisEvent[], calls: AnalysisEvent[]):
         confidence: 'high',
         actorId: window[0].compact.actorId,
         sessionId: window[0].compact.sessionId,
+        provider: window[0].compact.provider,
         startedAt: window[0].compact.timestamp,
         endedAt: window[1].read.timestamp,
         callIds,

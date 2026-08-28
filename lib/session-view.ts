@@ -5,6 +5,7 @@ import {
   usageTokenCount,
   type AnalysisEvent,
   type AnalysisSession,
+  type Anomaly,
   type Behavior,
   type CostSummary,
   type Usage,
@@ -153,7 +154,22 @@ export function eventsForSession<T extends { sessionId?: string; provider?: stri
   return events.filter((event) => event.sessionId === session.id && event.provider === session.provider);
 }
 
-/** Largest-remainder percents so a mutually exclusive set always sums to 100, never 99 or 101. */
+export function anomalyBelongsToSession(
+  anomaly: Pick<Anomaly, 'sessionId' | 'provider'>,
+  session: Pick<AnalysisSession, 'id' | 'provider'>,
+): boolean {
+  return anomaly.sessionId === session.id && anomaly.provider === session.provider;
+}
+
+export function sessionParentPresent(
+  session: Pick<AnalysisSession, 'provider' | 'parentSessionId'>,
+  present: { has(key: string): boolean },
+): boolean {
+  const parentKey = parentCollapseKey(session);
+  return Boolean(parentKey && present.has(parentKey));
+}
+
+/** Largest-remainder percents. Parts at or under the given total may leave remainder; parts above it rescale so the result never exceeds 100. */
 export function sharePercents(values: readonly number[], total = values.reduce((sum, value) => sum + value, 0)): number[] {
   if (total <= 0) return values.map(() => 0);
   const covered = values.reduce((sum, value) => sum + Math.max(0, value), 0);
@@ -252,14 +268,13 @@ export function sessionGrowthRate(session: Pick<AnalysisSession, 'ownCalls' | 'l
 
 export function formatGrowthRate(rate: number | undefined): string {
   if (rate === undefined || !Number.isFinite(rate)) return '—';
-  if (rate === 0) return '0 / 分钟';
-  if (rate > 0 && rate < 1) return '<1 / 分钟';
-  return formatTokenCount(rate) + ' / 分钟';
+  const amount = rate === 0 ? '0' : rate > 0 && rate < 1 ? '<1' : formatTokenCount(rate);
+  return '窗口内 ' + amount + ' / 分钟';
 }
 
 export function formatGrowthCaption(rate: number | undefined): string {
   if (rate === undefined || !Number.isFinite(rate)) return '调用不足两条或时间无效';
-  return '会话末 15 分钟窗口平均 · ' + formatExactTokenCount(rate) + ' tokens / 分钟';
+  return '会话末窗口平均（最长 15 分钟）· ' + formatExactTokenCount(rate) + ' tokens / 分钟';
 }
 
 export const GROWTH_WINDOW_MS = 15 * 60_000;
@@ -375,10 +390,10 @@ export function confidenceLabel(confidence: 'high' | 'medium' | 'low'): string {
 export function sessionRoleLabel(
   session: Pick<AnalysisSession, 'parentSessionId'>,
   depth: number,
-  options?: { parentPresent?: boolean },
+  options?: { parentPresent?: boolean; childList?: boolean },
 ): string {
   if (!session.parentSessionId) return '主会话';
-  if (depth > 0) return '子会话';
+  if (depth > 0 || options?.childList) return '子会话';
   if (options?.parentPresent) return '子会话（循环归属）';
   return '子会话（父会话不在当前范围）';
 }

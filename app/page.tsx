@@ -4,6 +4,7 @@ import Link from 'next/link';
 import { contextInventoryIndex, contextSessionKey, type ContextCategory, type SessionContextInventory } from '@/lib/context-inventory';
 import {
   aggregateTokenComposition,
+  anomalyBelongsToSession,
   behaviorKey,
   behaviorShares,
   callContentIndex,
@@ -11,9 +12,9 @@ import {
   confidenceLabel,
   costCaption,
   displayCost,
-  formatCallAmount,
   eventsForSession,
   findSessionByKey,
+  formatCallAmount,
   formatGrowthCaption,
   formatGrowthRate,
   formatSharePercent,
@@ -25,6 +26,7 @@ import {
   sessionForest,
   sessionGrowthRate,
   sessionIsActive,
+  sessionParentPresent,
   sessionRoleLabel,
   sessionTreeRows,
   sessionsInTimeRange,
@@ -775,11 +777,9 @@ export default function Home() {
   const visibleAnomalies = useMemo(
     () =>
       analysis.anomalies.filter(
-        (anomaly) =>
-          providerFilter === 'all' ||
-          analysis.sessions.find((session) => session.id === anomaly.sessionId)?.provider === providerFilter,
+        (anomaly) => providerFilter === 'all' || anomaly.provider === providerFilter,
       ),
-    [analysis.anomalies, analysis.sessions, providerFilter],
+    [analysis.anomalies, providerFilter],
   );
   const selectedSession = findSessionByKey(analysis.sessions, selectedSessionKey);
   const contextInventories = useMemo(() => contextInventoryIndex(analysis.events), [analysis.events]);
@@ -865,18 +865,23 @@ export default function Home() {
     setSelectedSessionKey(null);
   }
 
-  function renderSessionTable(sessions: AnalysisSession[], forest?: SessionForest<AnalysisSession>, roots?: AnalysisSession[]) {
+  function renderSessionTable(
+    sessions: AnalysisSession[],
+    forest?: SessionForest<AnalysisSession>,
+    roots?: AnalysisSession[],
+    options?: { present?: { has(key: string): boolean }; childList?: boolean },
+  ) {
     const tree = forest ?? sessionForest(sessions);
     const rows = sessionTreeRows(sessions, collapsedSessionIds, tree, roots);
-    const present = tree.byKey;
+    const present = options?.present ?? tree.byKey;
     return <div className="table-wrap session-table-viewport"><table role="treegrid" aria-label="会话树">
       <thead><tr><th>目录 - Session</th><th>Agent</th><th>自身 Token</th><th>含子会话</th><th>预估费用</th><th>最近增速</th><th>Tools 字符</th><th>Skills 字符</th><th>最近数据</th></tr></thead>
       <tbody>{rows.length ? rows.map(({ session, depth, childCount }) => {
         const cost = displayCost(session.inclusiveCost, currency);
         const growth = sessionGrowthRate(session);
         const collapsed = collapsedSessionIds.has(sessionCollapseKey(session));
-        const parentPresent = Boolean(session.parentSessionId && present.has(session.provider + '\0' + session.parentSessionId));
-        const role = sessionRoleLabel(session, depth, { parentPresent });
+        const parentPresent = sessionParentPresent(session, present);
+        const role = sessionRoleLabel(session, depth, { parentPresent, childList: options?.childList });
         return <tr key={sessionCollapseKey(session)} className={depth ? 'child-session-row' : undefined} role="row" aria-level={depth + 1} aria-expanded={childCount > 0 ? !collapsed : undefined}>
           <td>
             <div className={'session-name-cell' + (depth ? ' child-session' : '')} style={depth > 1 ? { paddingLeft: 22 + (depth - 1) * 16 } : undefined}>
@@ -893,7 +898,7 @@ export default function Home() {
           <td className="mono" title={formatExactTokenCount(session.ownUsage.totalTokens)} aria-label={formatExactTokenCount(session.ownUsage.totalTokens)}><TokenFigure value={session.ownUsage.totalTokens} /></td>
           <td className="mono" title={formatExactTokenCount(session.inclusiveUsage.totalTokens)} aria-label={formatExactTokenCount(session.inclusiveUsage.totalTokens)}><TokenFigure value={session.inclusiveUsage.totalTokens} /></td>
           <td className={'mono cost-' + cost.tone} title={cost.note}>{cost.value}<small>{cost.note}</small></td>
-          <td className="mono" title={formatGrowthCaption(growth)}>{formatGrowthRate(growth)}</td>
+          <td className="mono" title={formatGrowthCaption(growth)} aria-label={formatGrowthCaption(growth)}>{formatGrowthRate(growth)}</td>
           {(['tools', 'skills'] as const).map((category) => {
             const snapshot = contextInventories.get(contextSessionKey(session.provider, session.id))?.[category]?.contextSnapshot;
             return <td key={category}><button className="context-length-link mono" title="最近记录的定义 / 目录字符数，点击查看组成；非 Token 用量" aria-label={category + ' 上下文 · ' + sessionDisplayName(session)} onClick={() => openSession(session, category)}>{snapshot ? snapshot.chars.toLocaleString('en-US') : '未知'}<small>查看组成 ↗</small></button></td>;
@@ -1119,7 +1124,7 @@ export default function Home() {
 
     const children = analysis.sessions.filter((session) => session.parentSessionId === selectedSession.id && session.provider === selectedSession.provider);
     const childRows = paginate(children, childPage, 15);
-    const anomalies = visibleAnomalies.filter((anomaly) => anomaly.sessionId === selectedSession.id);
+    const anomalies = visibleAnomalies.filter((anomaly) => anomalyBelongsToSession(anomaly, selectedSession));
     return <section className="view-stack session-detail">
       <button className="text-button back-to-sessions" onClick={() => { setSelectedSessionKey(null); window.scrollTo({ top: 0 }); }}>← 返回会话列表（第 {page.page} 页）· Esc</button>
       <article className="panel detail-panel">
@@ -1156,7 +1161,7 @@ export default function Home() {
         </div>}
         {detailSection === 'children' && <div className="sessions-panel">
           <Pagination {...childRows} onChange={setChildPage} label="直属子会话分页" unit="个子会话" />
-          {children.length ? renderSessionTable(childRows.items) : <EmptyState title="没有直属子会话" description="仅展示日志中有明确归属记录的子会话。" />}
+          {children.length ? renderSessionTable(childRows.items, undefined, undefined, { present: new Set(analysis.sessions.map(sessionCollapseKey)), childList: true }) : <EmptyState title="没有直属子会话" description="仅展示日志中有明确归属记录的子会话。" />}
         </div>}
         {detailSection === 'evidence' && <div className="compact-anomalies detail-scroll">
           {anomalies.map((anomaly) => <AnomalyCard key={anomaly.id} anomaly={anomaly} analysis={analysis} currency={currency} onToggleNecessary={toggleNecessary} onSelect={() => setSelectedAnomalyId(anomaly.id)} selected={selectedAnomalyId === anomaly.id} />)}
@@ -1175,7 +1180,7 @@ export default function Home() {
     const page = paginate(children, subagentPage, 15);
     return <section className="view-stack">
       <div className="view-intro"><div><span className="eyebrow">CHILD SESSIONS</span><h2>子 Agent</h2><p>每页 15 个子会话。仅按明确归属证据展示，不按目录或时间猜测关系。</p></div></div>
-      <div className="panel sessions-panel"><Pagination {...page} onChange={setSubagentPage} label="子 Agent 分页" unit="个子会话" />{renderSessionTable(page.items)}</div>
+      <div className="panel sessions-panel"><Pagination {...page} onChange={setSubagentPage} label="子 Agent 分页" unit="个子会话" />{renderSessionTable(page.items, undefined, undefined, { present: new Set(visibleSessions.map(sessionCollapseKey)), childList: true })}</div>
       <div className="panel callout-panel"><span className="callout-icon">i</span><div><strong>自身用量与含子会话合计是两个视图</strong><p>含子会话的费用不能再与子会话明细相加。</p></div></div>
     </section>;
   }

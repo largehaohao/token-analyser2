@@ -316,6 +316,7 @@ test('detects rereads, polling, and compaction loops with evidence', () => {
   assert.ok(analysis.anomalies.some((item) => item.type === 'compaction'));
   assert.ok(analysis.anomalies.every((item) => item.evidence.length > 0));
   assert.ok(analysis.anomalies.every((item) => item.recommendation));
+  assert.ok(analysis.anomalies.every((item) => item.provider === 'codex'));
 });
 
 test('keeps parent and child costs separate while exposing an inclusive total', () => {
@@ -892,4 +893,8 @@ test('Codex usage and cost do not invent tokens when cached input exceeds the in
   assert.equal(cost.breakdown.outputTokens, 4);
   assert.ok(cost.usd !== undefined);
   assert.equal(Number((cost.usd ?? 0).toFixed(10)), 4 * 5 / 1_000_000);
+  const analysis = buildAnalysis([call], [rate]);
+  assert.equal(analysis.usage.totalTokens, 4);
+  assert.equal(analysis.usage.cachedInputTokens, 0);
+  assert.equal(analysis.sessions[0]?.ownUsage.cachedInputTokens, 0);
 });
