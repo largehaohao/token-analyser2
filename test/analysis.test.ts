@@ -2,10 +2,12 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   buildAnalysis,
+  costForCalls,
   scopeAnalysis,
   defaultRateSnapshots,
   formatRelativeTime,
   parseJsonl,
+  usageTokenCount,
   type AnalysisEvent,
   type RateSnapshot,
 } from '../lib/analysis';
@@ -878,4 +880,16 @@ test('overview retains a child active in the window without importing parent usa
   assert.equal(scoped.sessions[0].id, 'child');
   assert.equal(scoped.sessions[0].inclusiveUsage.totalTokens, scoped.usage.totalTokens);
   assert.equal(scoped.usage.totalTokens, 200);
+});
+
+test('Codex usage and cost do not invent tokens when cached input exceeds the input snapshot', () => {
+  const usage = { inputTokens: 0, cachedInputTokens: 30, outputTokens: 4, inputIncludesCached: true };
+  assert.equal(usageTokenCount(usage), 4);
+  const call = event({ usage, model: 'gpt-5.6-sol' });
+  const cost = costForCalls([call], [rate]);
+  assert.equal(cost.breakdown.cachedInputTokens, 0);
+  assert.equal(cost.breakdown.inputTokens, 0);
+  assert.equal(cost.breakdown.outputTokens, 4);
+  assert.ok(cost.usd !== undefined);
+  assert.equal(Number((cost.usd ?? 0).toFixed(10)), 4 * 5 / 1_000_000);
 });

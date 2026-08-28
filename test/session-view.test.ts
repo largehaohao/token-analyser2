@@ -13,7 +13,11 @@ import {
   paginate,
   SESSION_TIME_RANGES,
   sessionDisplayName,
+  eventsForSession,
+  findSessionByKey,
+  formatGrowthCaption,
   sessionEntryCounts,
+  sessionForest,
   sessionGrowthRate,
   sessionIsActive,
   sessionRoleLabel,
@@ -144,6 +148,13 @@ test('share percents leave uncovered remainder when the given total is larger th
   assert.equal(formatSharePercent(12, 40), '12%');
 });
 
+test('share percents never sum above 100 when parts exceed the given total', () => {
+  const percents = sharePercents([60, 60], 100);
+  assert.deepEqual(percents, [50, 50]);
+  assert.equal(percents.reduce((sum, value) => sum + value, 0), 100);
+  assert.ok(sharePercents([80, 40, 30], 100).reduce((sum, value) => sum + value, 0) <= 100);
+});
+
 test('behavior shares keep mixed and unknown out of the other bucket', () => {
   const shares = behaviorShares([
     { behavior: 'code', usage: { inputTokens: 60, outputTokens: 0 } },
@@ -201,8 +212,9 @@ test('ended sessions keep the historical rate but are not presented as current b
   assert.equal(sessionIsActive({ lastDataAt: '2026-08-28T11:50:00.000Z' }, now), true);
   const rate = sessionGrowthRate(session);
   assert.ok(rate !== undefined);
-  assert.match(formatGrowthRate(rate, { active: false }), /^当时 /);
-  assert.equal(formatGrowthRate(rate, { active: true }).startsWith('当时'), false);
+  assert.equal(formatGrowthRate(rate).includes('当时'), false);
+  assert.match(formatGrowthCaption(rate), /会话末 15 分钟/);
+  assert.equal(formatGrowthCaption(undefined), '调用不足两条或时间无效');
 });
 
 test('displayCost does not present a missing rate as a billed zero', () => {
@@ -322,6 +334,14 @@ test('session tree keeps cyclic and self-parent sessions visible as entries', ()
   assert.equal(sessionRoleLabel(left, 0, { parentPresent: true }), '子会话（循环归属）');
   assert.equal(sessionRoleLabel(left, 1), '子会话');
   assert.equal(sessionRoleLabel({ parentSessionId: undefined }, 0), '主会话');
+  const cycleCounts = sessionEntryCounts([left, right]);
+  assert.equal(cycleCounts.primary, 0);
+  assert.equal(cycleCounts.children, 2);
+  assert.equal(cycleCounts.detached, 0);
+  assert.equal(cycleCounts.entries, 1);
+  const selfCounts = sessionEntryCounts([self]);
+  assert.equal(selfCounts.detached, 0);
+  assert.equal(selfCounts.entries, 1);
   const mixed = [
     { id: 'root', provider: 'codex' as const, parentSessionId: undefined },
     { id: 'child', provider: 'codex' as const, parentSessionId: 'root' },
@@ -335,6 +355,46 @@ test('session tree keeps cyclic and self-parent sessions visible as entries', ()
   assert.equal(counts.entries, 2);
 });
 
+test('opening a session uses provider and id so same-id sessions do not collide', () => {
+  const codex = { id: 'main', provider: 'codex' as const };
+  const claude = { id: 'main', provider: 'claude' as const };
+  const sessions = [codex, claude];
+  assert.equal(findSessionByKey(sessions, 'codex\0main'), codex);
+  assert.equal(findSessionByKey(sessions, 'claude\0main'), claude);
+  assert.equal(findSessionByKey(sessions, 'main'), undefined);
+  assert.equal(findSessionByKey(sessions, null), undefined);
+  const events = [
+    { sessionId: 'main', provider: 'codex' as const, id: 'c1' },
+    { sessionId: 'main', provider: 'claude' as const, id: 'c2' },
+  ];
+  assert.deepEqual(eventsForSession(events, claude).map((event) => event.id), ['c2']);
+  assert.deepEqual(eventsForSession(events, undefined), []);
+});
+
+test('session forest is reused for roots, counts, rows and descendants', () => {
+  const parent = { id: 'main', provider: 'codex' as const, parentSessionId: undefined };
+  const child = { id: 'child', provider: 'codex' as const, parentSessionId: 'main' };
+  const other = { id: 'main', provider: 'claude' as const, parentSessionId: undefined };
+  const forest = sessionForest([parent, child, other]);
+  assert.deepEqual(forest.roots.map((session) => session.provider + ':' + session.id), ['codex:main', 'claude:main']);
+  assert.deepEqual(sessionRoots([parent, child, other], forest), forest.roots);
+  assert.equal(sessionEntryCounts([parent, child, other], forest).entries, 2);
+  assert.equal(sessionTreeRows([parent, child, other], new Set(), forest).length, 3);
+  assert.deepEqual(sessionsUnderRoots([parent, child, other], [parent], forest).map((session) => session.id), ['main', 'child']);
+});
+
+test('session tree walk stays iterative on a deep imported chain', () => {
+  const chain = Array.from({ length: 4000 }, (_, index) => ({
+    id: 'n' + String(index),
+    provider: 'codex' as const,
+    parentSessionId: index === 0 ? undefined : 'n' + String(index - 1),
+  }));
+  const forest = sessionForest(chain);
+  assert.equal(forest.roots.length, 1);
+  assert.equal(sessionTreeRows(chain, new Set(), forest).length, 4000);
+  assert.equal(sessionsUnderRoots(chain, forest.roots, forest).length, 4000);
+});
+
 test('token count formatting distinguishes unknown, zero, and sub-one values', () => {
   assert.equal(formatTokenCount(0), '0');
   assert.equal(formatTokenCount(0.4), '<1');
@@ -342,11 +402,13 @@ test('token count formatting distinguishes unknown, zero, and sub-one values', (
   assert.equal(formatExactTokenCount(12345).replace(/\D/g, ''), '12345');
 });
 
-test('token composition total matches usageTokenCount when cached input exceeds the input snapshot', () => {
+test('token composition does not invent Codex tokens when cached input exceeds the input snapshot', () => {
   const usage = { inputTokens: 0, cachedInputTokens: 30, outputTokens: 4, inputIncludesCached: true };
+  assert.equal(usageTokenCount(usage), 4);
   const composition = tokenComposition(usage)!;
   assert.equal(composition.uncached, 0);
-  assert.equal(composition.cached, 30);
+  assert.equal(composition.cached, 0);
+  assert.equal(composition.total, 4);
   assert.equal(composition.total, usageTokenCount(usage));
   assert.equal(aggregateTokenComposition([{ usage } as AnalysisEvent]).total, usageTokenCount(usage));
 });

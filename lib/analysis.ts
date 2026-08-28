@@ -1380,6 +1380,11 @@ function emptyUsage(): UsageSummary {
   };
 }
 
+function cachedInputTokens(usage: Usage): number {
+  const cached = usage.cachedInputTokens ?? 0;
+  return usage.inputIncludesCached ? Math.min(cached, usage.inputTokens) : cached;
+}
+
 /**
  * Returns the additive Token count for one usage record while respecting
  * provider semantics. Codex input snapshots can already include cached input;
@@ -1387,9 +1392,9 @@ function emptyUsage(): UsageSummary {
  */
 export function usageTokenCount(usage?: Usage): number {
   if (!usage) return 0;
-  const cached = usage.cachedInputTokens ?? 0;
+  const cached = cachedInputTokens(usage);
   const cacheCreation = usage.cacheCreationInputTokens ?? 0;
-  const input = usage.inputIncludesCached ? Math.max(usage.inputTokens, cached) : usage.inputTokens + cached;
+  const input = usage.inputIncludesCached ? usage.inputTokens : usage.inputTokens + cached;
   const reasoning = usage.outputIncludesReasoning ? 0 : (usage.reasoningTokens ?? 0);
   return input + cacheCreation + usage.outputTokens + reasoning;
 }
@@ -1495,7 +1500,7 @@ function calculateCost(
       continue;
     }
     const usage = call.usage;
-    const cached = usage.cachedInputTokens ?? 0;
+    const cached = cachedInputTokens(usage);
     const cacheCreation = usage.cacheCreationInputTokens ?? 0;
     breakdown.inputTokens += usage.inputTokens;
     breakdown.cachedInputTokens += cached;

@@ -1,4 +1,5 @@
 import {
+  formatExactTokenCount,
   formatMoney,
   formatTokenCount,
   usageTokenCount,
@@ -31,7 +32,8 @@ export function sessionsInTimeRange<T extends { lastDataAt?: string }>(sessions:
 /** Mutually exclusive buckets: cached input and reasoning must not be added twice. */
 export function tokenComposition(usage?: Usage) {
   if (!usage) return undefined;
-  const cached = usage.cachedInputTokens ?? 0;
+  const reportedCached = usage.cachedInputTokens ?? 0;
+  const cached = usage.inputIncludesCached ? Math.min(reportedCached, usage.inputTokens) : reportedCached;
   const uncached = usage.inputIncludesCached ? Math.max(0, usage.inputTokens - cached) : usage.inputTokens;
   const cacheWrite = usage.cacheCreationInputTokens ?? 0;
   const output = usage.outputTokens + (usage.outputIncludesReasoning ? 0 : usage.reasoningTokens ?? 0);
@@ -135,13 +137,31 @@ export function sessionCollapseKey(session: Pick<AnalysisSession, 'id' | 'provid
   return session.provider + '\0' + session.id;
 }
 
+export function findSessionByKey<T extends Pick<AnalysisSession, 'id' | 'provider'>>(
+  sessions: readonly T[],
+  key: string | null | undefined,
+): T | undefined {
+  if (!key) return undefined;
+  return sessions.find((session) => sessionCollapseKey(session) === key);
+}
+
+export function eventsForSession<T extends { sessionId?: string; provider?: string }>(
+  events: readonly T[],
+  session: Pick<AnalysisSession, 'id' | 'provider'> | undefined,
+): T[] {
+  if (!session) return [];
+  return events.filter((event) => event.sessionId === session.id && event.provider === session.provider);
+}
+
 /** Largest-remainder percents so a mutually exclusive set always sums to 100, never 99 or 101. */
 export function sharePercents(values: readonly number[], total = values.reduce((sum, value) => sum + value, 0)): number[] {
   if (total <= 0) return values.map(() => 0);
   const covered = values.reduce((sum, value) => sum + Math.max(0, value), 0);
-  const raw = values.map((value) => (Math.max(0, value) / total) * 100);
+  const basis = covered > total ? covered : total;
+  if (basis <= 0) return values.map(() => 0);
+  const raw = values.map((value) => (Math.max(0, value) / basis) * 100);
   const floored = raw.map((value) => Math.floor(value));
-  const target = Math.min(100, Math.round((covered / total) * 100));
+  const target = Math.min(100, Math.round((covered / basis) * 100));
   let remain = Math.max(0, target - floored.reduce((sum, value) => sum + value, 0));
   const order = raw
     .map((value, index) => ({ index, frac: value - Math.floor(value) }))
@@ -230,12 +250,16 @@ export function sessionGrowthRate(session: Pick<AnalysisSession, 'ownCalls' | 'l
   return tokens / (windowMs / 60_000);
 }
 
-export function formatGrowthRate(rate: number | undefined, options?: { active?: boolean }): string {
+export function formatGrowthRate(rate: number | undefined): string {
   if (rate === undefined || !Number.isFinite(rate)) return '—';
-  const prefix = options?.active === false ? '当时 ' : '';
-  if (rate === 0) return prefix + '0 / 分钟';
-  if (rate > 0 && rate < 1) return prefix + '<1 / 分钟';
-  return prefix + formatTokenCount(rate) + ' / 分钟';
+  if (rate === 0) return '0 / 分钟';
+  if (rate > 0 && rate < 1) return '<1 / 分钟';
+  return formatTokenCount(rate) + ' / 分钟';
+}
+
+export function formatGrowthCaption(rate: number | undefined): string {
+  if (rate === undefined || !Number.isFinite(rate)) return '调用不足两条或时间无效';
+  return '会话末 15 分钟窗口平均 · ' + formatExactTokenCount(rate) + ' tokens / 分钟';
 }
 
 export const GROWTH_WINDOW_MS = 15 * 60_000;
@@ -361,96 +385,124 @@ export function sessionRoleLabel(
 
 export function sessionEntryCounts<T extends Pick<AnalysisSession, 'id' | 'provider' | 'parentSessionId'>>(
   sessions: readonly T[],
+  forest?: SessionForest<T>,
 ): { total: number; primary: number; children: number; detached: number; entries: number } {
-  const roots = sessionRoots(sessions);
+  const tree = forest ?? sessionForest(sessions);
   return {
     total: sessions.length,
     primary: sessions.filter((session) => !session.parentSessionId).length,
     children: sessions.filter((session) => Boolean(session.parentSessionId)).length,
-    detached: roots.filter((session) => Boolean(session.parentSessionId)).length,
-    entries: roots.length,
+    detached: tree.roots.filter((session) => {
+      const parentKey = parentCollapseKey(session);
+      return Boolean(parentKey && !tree.byKey.has(parentKey));
+    }).length,
+    entries: tree.roots.length,
   };
 }
 
-function sessionChildMap<T extends Pick<AnalysisSession, 'id' | 'provider' | 'parentSessionId'>>(
+function parentCollapseKey(session: Pick<AnalysisSession, 'provider' | 'parentSessionId'>): string | undefined {
+  return session.parentSessionId ? session.provider + '\0' + session.parentSessionId : undefined;
+}
+
+export interface SessionForest<T extends Pick<AnalysisSession, 'id' | 'provider' | 'parentSessionId'>> {
+  sessions: readonly T[];
+  byKey: Map<string, T>;
+  children: Map<string, T[]>;
+  roots: T[];
+}
+
+export function sessionForest<T extends Pick<AnalysisSession, 'id' | 'provider' | 'parentSessionId'>>(
   sessions: readonly T[],
-): Map<string, T[]> {
+): SessionForest<T> {
+  const byKey = new Map(sessions.map((session) => [sessionCollapseKey(session), session]));
   const children = new Map<string, T[]>();
-  const keys = new Set(sessions.map(sessionCollapseKey));
   for (const session of sessions) {
-    if (!session.parentSessionId) continue;
-    const parentKey = session.provider + '\0' + session.parentSessionId;
-    const selfKey = sessionCollapseKey(session);
-    if (!keys.has(parentKey) || parentKey === selfKey) continue;
+    const parentKey = parentCollapseKey(session);
+    if (!parentKey || !byKey.has(parentKey) || parentKey === sessionCollapseKey(session)) continue;
     const list = children.get(parentKey) ?? [];
     list.push(session);
     children.set(parentKey, list);
   }
-  return children;
-}
-
-export function sessionRoots<T extends Pick<AnalysisSession, 'id' | 'provider' | 'parentSessionId'>>(sessions: readonly T[]): T[] {
-  const byKey = new Map(sessions.map((session) => [sessionCollapseKey(session), session]));
-  const children = sessionChildMap(sessions);
   const visited = new Set<string>();
-  const walk = (session: T) => {
-    const key = sessionCollapseKey(session);
-    if (visited.has(key)) return;
-    visited.add(key);
-    for (const child of children.get(key) ?? []) walk(child);
+  const mark = (start: T) => {
+    const stack = [start];
+    while (stack.length) {
+      const session = stack.pop()!;
+      const key = sessionCollapseKey(session);
+      if (visited.has(key)) continue;
+      visited.add(key);
+      const kids = children.get(key) ?? [];
+      for (let index = kids.length - 1; index >= 0; index -= 1) stack.push(kids[index]!);
+    }
   };
   const roots: T[] = [];
   for (const session of sessions) {
-    const parentKey = session.parentSessionId ? session.provider + '\0' + session.parentSessionId : undefined;
+    const parentKey = parentCollapseKey(session);
     if (!parentKey || !byKey.has(parentKey)) {
       roots.push(session);
-      walk(session);
+      mark(session);
     }
   }
   for (const session of sessions) {
     if (visited.has(sessionCollapseKey(session))) continue;
     roots.push(session);
-    walk(session);
+    mark(session);
   }
-  return roots;
+  return { sessions, byKey, children, roots };
+}
+
+export function sessionRoots<T extends Pick<AnalysisSession, 'id' | 'provider' | 'parentSessionId'>>(
+  sessions: readonly T[],
+  forest?: SessionForest<T>,
+): T[] {
+  return (forest ?? sessionForest(sessions)).roots;
 }
 
 export function sessionTreeRows<T extends Pick<AnalysisSession, 'id' | 'provider' | 'parentSessionId'>>(
   sessions: readonly T[],
   collapsedIds: ReadonlySet<string>,
+  forest?: SessionForest<T>,
+  roots?: readonly T[],
 ): Array<{ session: T; depth: number; childCount: number }> {
-  const children = sessionChildMap(sessions);
+  const tree = forest ?? sessionForest(sessions);
   const rows: Array<{ session: T; depth: number; childCount: number }> = [];
-  const walk = (session: T, depth: number, trail: ReadonlySet<string>) => {
+  const stack: Array<{ session: T; depth: number; trail: ReadonlySet<string> }> = [];
+  const start = roots ?? tree.roots;
+  for (let index = start.length - 1; index >= 0; index -= 1) {
+    stack.push({ session: start[index]!, depth: 0, trail: new Set() });
+  }
+  while (stack.length) {
+    const { session, depth, trail } = stack.pop()!;
     const key = sessionCollapseKey(session);
-    if (trail.has(key)) return;
+    if (trail.has(key)) continue;
     const nextTrail = new Set(trail);
     nextTrail.add(key);
-    const kids = (children.get(key) ?? []).filter((child) => !nextTrail.has(sessionCollapseKey(child)));
+    const kids = (tree.children.get(key) ?? []).filter((child) => !nextTrail.has(sessionCollapseKey(child)));
     rows.push({ session, depth, childCount: kids.length });
     if (kids.length && !collapsedIds.has(key)) {
-      for (const child of kids) walk(child, depth + 1, nextTrail);
+      for (let index = kids.length - 1; index >= 0; index -= 1) {
+        stack.push({ session: kids[index]!, depth: depth + 1, trail: nextTrail });
+      }
     }
-  };
-  for (const root of sessionRoots(sessions)) walk(root, 0, new Set());
+  }
   return rows;
 }
 
 export function sessionsUnderRoots<T extends Pick<AnalysisSession, 'id' | 'provider' | 'parentSessionId'>>(
   sessions: readonly T[],
   roots: readonly T[],
+  forest?: SessionForest<T>,
 ): T[] {
+  const tree = forest ?? sessionForest(sessions);
   const allowed = new Set(roots.map(sessionCollapseKey));
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const session of sessions) {
-      const key = sessionCollapseKey(session);
+  const stack = [...roots];
+  while (stack.length) {
+    const session = stack.pop()!;
+    for (const child of tree.children.get(sessionCollapseKey(session)) ?? []) {
+      const key = sessionCollapseKey(child);
       if (allowed.has(key)) continue;
-      if (session.parentSessionId && allowed.has(session.provider + '\0' + session.parentSessionId)) {
-        allowed.add(key);
-        changed = true;
-      }
+      allowed.add(key);
+      stack.push(child);
     }
   }
   return sessions.filter((session) => allowed.has(sessionCollapseKey(session)));
