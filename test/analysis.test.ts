@@ -2,10 +2,12 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   buildAnalysis,
+  costForCalls,
   scopeAnalysis,
   defaultRateSnapshots,
   formatRelativeTime,
   parseJsonl,
+  usageTokenCount,
   type AnalysisEvent,
   type RateSnapshot,
 } from '../lib/analysis';
@@ -314,6 +316,7 @@ test('detects rereads, polling, and compaction loops with evidence', () => {
   assert.ok(analysis.anomalies.some((item) => item.type === 'compaction'));
   assert.ok(analysis.anomalies.every((item) => item.evidence.length > 0));
   assert.ok(analysis.anomalies.every((item) => item.recommendation));
+  assert.ok(analysis.anomalies.every((item) => item.provider === 'codex'));
 });
 
 test('keeps parent and child costs separate while exposing an inclusive total', () => {
@@ -878,4 +881,124 @@ test('overview retains a child active in the window without importing parent usa
   assert.equal(scoped.sessions[0].id, 'child');
   assert.equal(scoped.sessions[0].inclusiveUsage.totalTokens, scoped.usage.totalTokens);
   assert.equal(scoped.usage.totalTokens, 200);
+});
+
+test('Codex usage and cost do not invent tokens when cached input exceeds the input snapshot', () => {
+  const usage = { inputTokens: 0, cachedInputTokens: 30, outputTokens: 4, inputIncludesCached: true };
+  assert.equal(usageTokenCount(usage), 4);
+  const call = event({ usage, model: 'gpt-5.6-sol' });
+  const cost = costForCalls([call], [rate]);
+  assert.equal(cost.breakdown.cachedInputTokens, 0);
+  assert.equal(cost.breakdown.inputTokens, 0);
+  assert.equal(cost.breakdown.outputTokens, 4);
+  assert.ok(cost.usd !== undefined);
+  assert.equal(Number((cost.usd ?? 0).toFixed(10)), 4 * 5 / 1_000_000);
+  const analysis = buildAnalysis([call], [rate]);
+  assert.equal(analysis.usage.totalTokens, 4);
+  assert.equal(analysis.usage.cachedInputTokens, 0);
+  assert.equal(analysis.sessions[0]?.ownUsage.cachedInputTokens, 0);
+  assert.equal(analysis.completeness, 'partial');
+  assert.equal(analysis.sessions[0]?.completeness, 'partial');
+});
+
+test('cyclic session graphs keep consistent incomplete inclusive totals', () => {
+  const pair = (first: 'a' | 'b', second: 'a' | 'b') => [
+    event({
+      id: first + '-call',
+      sessionId: first,
+      actorId: first,
+      parentSessionId: second,
+      usage: { inputTokens: 10, outputTokens: 0 },
+    }),
+    event({
+      id: second + '-call',
+      sessionId: second,
+      actorId: second,
+      parentSessionId: first,
+      usage: { inputTokens: 10, outputTokens: 0 },
+    }),
+  ];
+  const child = event({
+    id: 'leaf-call',
+    sessionId: 'leaf',
+    actorId: 'leaf',
+    parentSessionId: 'a',
+    usage: { inputTokens: 5, outputTokens: 0 },
+  });
+  for (const events of [pair('a', 'b'), pair('b', 'a')]) {
+    const analysis = buildAnalysis([...events, child], [rate]);
+    const a = analysis.sessions.find((session) => session.id === 'a')!;
+    const b = analysis.sessions.find((session) => session.id === 'b')!;
+    const leaf = analysis.sessions.find((session) => session.id === 'leaf')!;
+    assert.equal(a.completeness, 'partial');
+    assert.equal(b.completeness, 'partial');
+    assert.equal(leaf.completeness, 'complete');
+    assert.equal(a.ownUsage.totalTokens, 10);
+    assert.equal(b.ownUsage.totalTokens, 10);
+    assert.equal(a.inclusiveUsage.totalTokens, 15);
+    assert.equal(b.inclusiveUsage.totalTokens, 10);
+    assert.equal(leaf.inclusiveUsage.totalTokens, 5);
+    assert.equal(analysis.usage.totalTokens, 25);
+  }
+});
+
+test('inclusive session totals stay iterative on a deep imported chain', () => {
+  const events = Array.from({ length: 4000 }, (_, index) =>
+    event({
+      id: 'deep-call-' + String(index),
+      sessionId: 's' + String(index),
+      actorId: 's' + String(index),
+      parentSessionId: index === 0 ? undefined : 's' + String(index - 1),
+      usage: { inputTokens: 1, outputTokens: 0 },
+    }),
+  );
+  const analysis = buildAnalysis(events, [rate]);
+  assert.equal(analysis.sessions.length, 4000);
+  assert.equal(analysis.sessions.find((session) => session.id === 's0')?.inclusiveUsage.totalTokens, 4000);
+  assert.equal(analysis.sessions.find((session) => session.id === 's3999')?.inclusiveUsage.totalTokens, 1);
+});
+
+test('does not mix reread evidence across providers that share a session id', () => {
+  const events: AnalysisEvent[] = [];
+  for (const provider of ['codex', 'claude'] as const) {
+    for (const [index, seconds] of [0, 60, 120].entries()) {
+      events.push(
+        event({
+          id: provider + '-call-' + String(index),
+          provider,
+          sourceFile: provider + '.jsonl',
+          sourceLine: index + 1,
+          sessionId: 'shared',
+          actorId: 'shared',
+          timestamp: iso(seconds),
+          kind: 'model',
+          model: provider === 'claude' ? 'claude-sonnet-4' : 'gpt-5.6-sol',
+          usage: { inputTokens: 10, outputTokens: 0 },
+        }),
+        event({
+          id: provider + '-read-' + String(index),
+          provider,
+          sourceFile: provider + '.jsonl',
+          sourceLine: index + 1,
+          sessionId: 'shared',
+          actorId: 'shared',
+          timestamp: iso(seconds),
+          kind: 'tool',
+          callId: provider + '-call-' + String(index),
+          toolName: 'Read',
+          filePath: 'same.ts',
+          fileRange: '1-3',
+          contentHash: 'same',
+        }),
+      );
+    }
+  }
+  const analysis = buildAnalysis(events, [rate, { ...rate, id: 'claude-rate', provider: 'claude' }]);
+  const rereads = analysis.anomalies.filter((item) => item.type === 'reread');
+  assert.equal(rereads.length, 2);
+  for (const item of rereads) {
+    assert.equal(item.callIds.length, 3);
+    assert.ok(item.callIds.every((id) => id.startsWith(item.provider + '-')));
+    assert.ok(item.evidence.every((evidence) => evidence.sourceFile === item.provider + '.jsonl'));
+  }
 });
