@@ -5,21 +5,28 @@ import {
   behaviorShares,
   callContentIndex,
   candidateShare,
+  costCaption,
   displayCost,
   formatCallAmount,
   formatGrowthRate,
+  formatSharePercent,
   paginate,
   SESSION_TIME_RANGES,
   sessionDisplayName,
+  sessionEntryCounts,
   sessionGrowthRate,
+  sessionIsActive,
+  sessionRoleLabel,
   sessionRoots,
   sessionsUnderRoots,
   sessionTreeRows,
   sessionsInTimeRange,
   sharePercents,
+  shouldHandleEscape,
   tokenComposition,
+  trendChartMode,
 } from '../lib/session-view';
-import { buildAnalysis, formatExactTokenCount, formatTokenCount, parseJsonl, type AnalysisEvent, type CostSummary } from '../lib/analysis';
+import { buildAnalysis, formatExactTokenCount, formatTokenCount, parseJsonl, usageTokenCount, type AnalysisEvent, type CostSummary } from '../lib/analysis';
 
 test('session labels use directory basename and explicit title with honest fallbacks', () => {
   assert.equal(sessionDisplayName({ id: 'abc', title: '优化 UI', cwd: '/projects/token-analyser2/' }), 'token-analyser2 - 优化 UI');
@@ -128,6 +135,15 @@ test('share percents use largest remainder so mutually exclusive slices sum to 1
   assert.deepEqual(sharePercents([10, 0]), [100, 0]);
 });
 
+test('share percents leave uncovered remainder when the given total is larger than the parts', () => {
+  assert.deepEqual(sharePercents([10, 10], 100), [10, 10]);
+  assert.equal(sharePercents([10, 10], 100).reduce((sum, value) => sum + value, 0), 20);
+  assert.deepEqual(sharePercents([1, 1], 3), [34, 33]);
+  assert.equal(formatSharePercent(0, 12), '<1%');
+  assert.equal(formatSharePercent(0, 0), '0%');
+  assert.equal(formatSharePercent(12, 40), '12%');
+});
+
 test('behavior shares keep mixed and unknown out of the other bucket', () => {
   const shares = behaviorShares([
     { behavior: 'code', usage: { inputTokens: 60, outputTokens: 0 } },
@@ -169,6 +185,24 @@ test('session growth uses a recent window instead of the last two noisy calls', 
   assert.ok(Math.abs((rate ?? 0) - 1000) < 1e-6);
   assert.equal(formatGrowthRate(undefined), '—');
   assert.equal(formatGrowthRate(0.4), '<1 / 分钟');
+});
+
+test('ended sessions keep the historical rate but are not presented as current burn', () => {
+  const endedAt = '2026-08-25T12:00:00.000Z';
+  const now = Date.parse('2026-08-28T12:00:00.000Z');
+  const session = {
+    lastDataAt: endedAt,
+    ownCalls: [
+      { timestamp: '2026-08-25T11:50:00.000Z', usage: { inputTokens: 15_000, outputTokens: 0 } },
+      { timestamp: endedAt, usage: { inputTokens: 15_000, outputTokens: 0 } },
+    ] as AnalysisEvent[],
+  };
+  assert.equal(sessionIsActive(session, now), false);
+  assert.equal(sessionIsActive({ lastDataAt: '2026-08-28T11:50:00.000Z' }, now), true);
+  const rate = sessionGrowthRate(session);
+  assert.ok(rate !== undefined);
+  assert.match(formatGrowthRate(rate, { active: false }), /^当时 /);
+  assert.equal(formatGrowthRate(rate, { active: true }).startsWith('当时'), false);
 });
 
 test('displayCost does not present a missing rate as a billed zero', () => {
@@ -240,6 +274,20 @@ test('candidate share never fills an unknown cost with zero to invent a percenta
   assert.equal(candidateShare(known, { ...known, usd: 2.4 }, 'usd').percent, 24);
   assert.equal(candidateShare(known, unknown, 'usd').percent, undefined);
   assert.match(candidateShare(known, unknown, 'usd').note, /无法计算占比/);
+  const creditsOnly: CostSummary = {
+    credits: 50,
+    complete: false,
+    usdComplete: false,
+    creditsComplete: true,
+    hasKnownAmount: true,
+    basis: 'credits',
+    knownCalls: 2,
+    unknownCalls: 0,
+    breakdown: { inputTokens: 0, cachedInputTokens: 0, cacheCreationInputTokens: 0, outputTokens: 0 },
+  };
+  const creditsShare = candidateShare(creditsOnly, { ...creditsOnly, credits: 10 }, 'usd');
+  assert.equal(creditsShare.percent, 20);
+  assert.match(creditsShare.note, /credits/);
 });
 
 test('session tree expands children under the matching provider parent', () => {
@@ -262,10 +310,71 @@ test('session tree expands children under the matching provider parent', () => {
   );
 });
 
+test('session tree keeps cyclic and self-parent sessions visible as entries', () => {
+  const left = { id: 'a', provider: 'codex' as const, parentSessionId: 'b' };
+  const right = { id: 'b', provider: 'codex' as const, parentSessionId: 'a' };
+  const self = { id: 'loop', provider: 'claude' as const, parentSessionId: 'loop' };
+  const cycleRows = sessionTreeRows([left, right], new Set());
+  assert.equal(cycleRows.length, 2);
+  assert.equal(cycleRows.filter((row) => row.depth === 0).length, 1);
+  assert.equal(sessionTreeRows([self], new Set()).length, 1);
+  assert.equal(sessionRoleLabel(left, 0), '子会话（父会话不在当前范围）');
+  assert.equal(sessionRoleLabel(left, 0, { parentPresent: true }), '子会话（循环归属）');
+  assert.equal(sessionRoleLabel(left, 1), '子会话');
+  assert.equal(sessionRoleLabel({ parentSessionId: undefined }, 0), '主会话');
+  const mixed = [
+    { id: 'root', provider: 'codex' as const, parentSessionId: undefined },
+    { id: 'child', provider: 'codex' as const, parentSessionId: 'root' },
+    { id: 'orphan', provider: 'codex' as const, parentSessionId: 'missing' },
+  ];
+  const counts = sessionEntryCounts(mixed);
+  assert.equal(counts.total, 3);
+  assert.equal(counts.primary, 1);
+  assert.equal(counts.detached, 1);
+  assert.equal(counts.children, 2);
+  assert.equal(counts.entries, 2);
+});
+
 test('token count formatting distinguishes unknown, zero, and sub-one values', () => {
   assert.equal(formatTokenCount(0), '0');
   assert.equal(formatTokenCount(0.4), '<1');
   assert.equal(formatTokenCount(Number.NaN), '未知');
   assert.equal(formatExactTokenCount(12345).replace(/\D/g, ''), '12345');
+});
+
+test('token composition total matches usageTokenCount when cached input exceeds the input snapshot', () => {
+  const usage = { inputTokens: 0, cachedInputTokens: 30, outputTokens: 4, inputIncludesCached: true };
+  const composition = tokenComposition(usage)!;
+  assert.equal(composition.uncached, 0);
+  assert.equal(composition.cached, 30);
+  assert.equal(composition.total, usageTokenCount(usage));
+  assert.equal(aggregateTokenComposition([{ usage } as AnalysisEvent]).total, usageTokenCount(usage));
+});
+
+test('cost captions do not repeat the completeness note', () => {
+  const partial: CostSummary = {
+    usd: 1.23,
+    complete: false,
+    usdComplete: false,
+    creditsComplete: false,
+    hasKnownAmount: true,
+    basis: '已知小计',
+    knownCalls: 1,
+    unknownCalls: 1,
+    breakdown: { inputTokens: 10, cachedInputTokens: 0, cacheCreationInputTokens: 0, outputTokens: 1 },
+  };
+  const caption = costCaption(partial, 'usd');
+  assert.equal(caption.includes('已知小计') && caption.includes('可追溯'), false);
+  assert.match(caption, /已知小计/);
+  assert.equal((caption.match(/已知小计/g) ?? []).length, 1);
+});
+
+test('escape closing ignores typing targets and trend unknown-only ranges stay empty', () => {
+  assert.equal(shouldHandleEscape(null), true);
+  const input = { closest: (selector: string) => (selector.includes('input') ? {} : null) };
+  assert.equal(shouldHandleEscape(input), false);
+  assert.equal(trendChartMode([]), 'empty');
+  assert.equal(trendChartMode([{ known: false }, { known: false }]), 'unknown-only');
+  assert.equal(trendChartMode([{ known: true }, { known: false }]), 'chart');
 });
 

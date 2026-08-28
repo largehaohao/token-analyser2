@@ -138,9 +138,11 @@ export function sessionCollapseKey(session: Pick<AnalysisSession, 'id' | 'provid
 /** Largest-remainder percents so a mutually exclusive set always sums to 100, never 99 or 101. */
 export function sharePercents(values: readonly number[], total = values.reduce((sum, value) => sum + value, 0)): number[] {
   if (total <= 0) return values.map(() => 0);
-  const raw = values.map((value) => (value / total) * 100);
+  const covered = values.reduce((sum, value) => sum + Math.max(0, value), 0);
+  const raw = values.map((value) => (Math.max(0, value) / total) * 100);
   const floored = raw.map((value) => Math.floor(value));
-  let remain = 100 - floored.reduce((sum, value) => sum + value, 0);
+  const target = Math.min(100, Math.round((covered / total) * 100));
+  let remain = Math.max(0, target - floored.reduce((sum, value) => sum + value, 0));
   const order = raw
     .map((value, index) => ({ index, frac: value - Math.floor(value) }))
     .sort((left, right) => right.frac - left.frac || left.index - right.index);
@@ -149,6 +151,11 @@ export function sharePercents(values: readonly number[], total = values.reduce((
     result[order[offset % order.length]!.index] += 1;
   }
   return result;
+}
+
+export function formatSharePercent(percent: number, tokens = 0): string {
+  if (tokens > 0 && percent <= 0) return '<1%';
+  return String(percent) + '%';
 }
 
 export function behaviorKey(behavior?: Behavior): Behavior {
@@ -215,7 +222,7 @@ export function sessionGrowthRate(session: Pick<AnalysisSession, 'ownCalls' | 'l
   const end = Date.parse(session.lastDataAt || calls.at(-1)!.timestamp);
   const start = Date.parse(calls[0]!.timestamp);
   if (!Number.isFinite(end) || !Number.isFinite(start) || end <= start) return undefined;
-  const windowMs = Math.min(15 * 60_000, end - start);
+  const windowMs = Math.min(GROWTH_WINDOW_MS, end - start);
   const since = end - windowMs;
   const tokens = calls
     .filter((call) => Date.parse(call.timestamp) >= since)
@@ -223,11 +230,19 @@ export function sessionGrowthRate(session: Pick<AnalysisSession, 'ownCalls' | 'l
   return tokens / (windowMs / 60_000);
 }
 
-export function formatGrowthRate(rate: number | undefined): string {
+export function formatGrowthRate(rate: number | undefined, options?: { active?: boolean }): string {
   if (rate === undefined || !Number.isFinite(rate)) return '—';
-  if (rate === 0) return '0 / 分钟';
-  if (rate > 0 && rate < 1) return '<1 / 分钟';
-  return formatTokenCount(rate) + ' / 分钟';
+  const prefix = options?.active === false ? '当时 ' : '';
+  if (rate === 0) return prefix + '0 / 分钟';
+  if (rate > 0 && rate < 1) return prefix + '<1 / 分钟';
+  return prefix + formatTokenCount(rate) + ' / 分钟';
+}
+
+export const GROWTH_WINDOW_MS = 15 * 60_000;
+
+export function sessionIsActive(session: Pick<AnalysisSession, 'lastDataAt'>, now = Date.now()): boolean {
+  const timestamp = session.lastDataAt ? Date.parse(session.lastDataAt) : Number.NaN;
+  return Number.isFinite(timestamp) && timestamp <= now && timestamp >= now - GROWTH_WINDOW_MS;
 }
 
 export function displayCost(
@@ -288,23 +303,43 @@ export function candidateShare(
   candidate: CostSummary,
   currency: 'usd' | 'credits',
 ): { percent: number | undefined; note: string } {
-  const total = cost[currency];
-  const part = candidate[currency];
-  if (total === undefined || part === undefined) {
+  const total = amountForDisplay(cost, currency);
+  const part = amountForDisplay(candidate, currency);
+  if (!total || !part) {
     return { percent: undefined, note: '缺少可比较的已知费用，无法计算占比' };
   }
-  if (total <= 0) {
+  if (total.unit !== part.unit) {
+    return { percent: undefined, note: '费用单位不一致，无法计算占比' };
+  }
+  if (total.value <= 0) {
     return {
-      percent: part === 0 ? 0 : undefined,
-      note: part === 0 ? '没有可计价调用' : '分母为零，无法计算占比',
+      percent: part.value === 0 ? 0 : undefined,
+      note: part.value === 0 ? '没有可计价调用' : '分母为零，无法计算占比',
     };
   }
+  const complete = total.unit === 'usd' ? cost.usdComplete && candidate.usdComplete : cost.creditsComplete && candidate.creditsComplete;
+  const unitLabel = total.unit === 'usd' ? 'USD' : 'credits';
   return {
-    percent: Math.round((part / total) * 100),
-    note: (currency === 'usd' ? cost.usdComplete && candidate.usdComplete : cost.creditsComplete && candidate.creditsComplete)
-      ? '占已知费用'
-      : '占已知小计',
+    percent: Math.round((part.value / total.value) * 100),
+    note: (complete ? '占已知费用' : '占已知小计') + '（' + unitLabel + '）',
   };
+}
+
+function amountForDisplay(
+  summary: CostSummary,
+  currency: 'usd' | 'credits',
+): { value: number; unit: 'usd' | 'credits' } | undefined {
+  if (currency === 'usd' && summary.usd !== undefined) return { value: summary.usd, unit: 'usd' };
+  if (currency === 'credits' && summary.credits !== undefined) return { value: summary.credits, unit: 'credits' };
+  if (currency === 'usd' && summary.credits !== undefined) return { value: summary.credits, unit: 'credits' };
+  if (currency === 'credits' && summary.usd !== undefined) return { value: summary.usd, unit: 'usd' };
+  return undefined;
+}
+
+export function costCaption(summary: CostSummary, currency: 'usd' | 'credits'): string {
+  const shown = displayCost(summary, currency);
+  if (shown.tone === 'partial' && !shown.note.includes('仍有缺口')) return shown.note + ' · 仍有缺口';
+  return shown.note;
 }
 
 export function confidenceLabel(confidence: 'high' | 'medium' | 'low'): string {
@@ -313,37 +348,91 @@ export function confidenceLabel(confidence: 'high' | 'medium' | 'low'): string {
   return '低';
 }
 
-export function sessionRoots<T extends Pick<AnalysisSession, 'id' | 'provider' | 'parentSessionId'>>(sessions: readonly T[]): T[] {
+export function sessionRoleLabel(
+  session: Pick<AnalysisSession, 'parentSessionId'>,
+  depth: number,
+  options?: { parentPresent?: boolean },
+): string {
+  if (!session.parentSessionId) return '主会话';
+  if (depth > 0) return '子会话';
+  if (options?.parentPresent) return '子会话（循环归属）';
+  return '子会话（父会话不在当前范围）';
+}
+
+export function sessionEntryCounts<T extends Pick<AnalysisSession, 'id' | 'provider' | 'parentSessionId'>>(
+  sessions: readonly T[],
+): { total: number; primary: number; children: number; detached: number; entries: number } {
+  const roots = sessionRoots(sessions);
+  return {
+    total: sessions.length,
+    primary: sessions.filter((session) => !session.parentSessionId).length,
+    children: sessions.filter((session) => Boolean(session.parentSessionId)).length,
+    detached: roots.filter((session) => Boolean(session.parentSessionId)).length,
+    entries: roots.length,
+  };
+}
+
+function sessionChildMap<T extends Pick<AnalysisSession, 'id' | 'provider' | 'parentSessionId'>>(
+  sessions: readonly T[],
+): Map<string, T[]> {
+  const children = new Map<string, T[]>();
   const keys = new Set(sessions.map(sessionCollapseKey));
-  return sessions.filter((session) => {
-    if (!session.parentSessionId) return true;
-    return !keys.has(session.provider + '\0' + session.parentSessionId);
-  });
+  for (const session of sessions) {
+    if (!session.parentSessionId) continue;
+    const parentKey = session.provider + '\0' + session.parentSessionId;
+    const selfKey = sessionCollapseKey(session);
+    if (!keys.has(parentKey) || parentKey === selfKey) continue;
+    const list = children.get(parentKey) ?? [];
+    list.push(session);
+    children.set(parentKey, list);
+  }
+  return children;
+}
+
+export function sessionRoots<T extends Pick<AnalysisSession, 'id' | 'provider' | 'parentSessionId'>>(sessions: readonly T[]): T[] {
+  const byKey = new Map(sessions.map((session) => [sessionCollapseKey(session), session]));
+  const children = sessionChildMap(sessions);
+  const visited = new Set<string>();
+  const walk = (session: T) => {
+    const key = sessionCollapseKey(session);
+    if (visited.has(key)) return;
+    visited.add(key);
+    for (const child of children.get(key) ?? []) walk(child);
+  };
+  const roots: T[] = [];
+  for (const session of sessions) {
+    const parentKey = session.parentSessionId ? session.provider + '\0' + session.parentSessionId : undefined;
+    if (!parentKey || !byKey.has(parentKey)) {
+      roots.push(session);
+      walk(session);
+    }
+  }
+  for (const session of sessions) {
+    if (visited.has(sessionCollapseKey(session))) continue;
+    roots.push(session);
+    walk(session);
+  }
+  return roots;
 }
 
 export function sessionTreeRows<T extends Pick<AnalysisSession, 'id' | 'provider' | 'parentSessionId'>>(
   sessions: readonly T[],
   collapsedIds: ReadonlySet<string>,
 ): Array<{ session: T; depth: number; childCount: number }> {
-  const children = new Map<string, T[]>();
-  const keys = new Set(sessions.map(sessionCollapseKey));
-  for (const session of sessions) {
-    if (!session.parentSessionId) continue;
-    const parentKey = session.provider + '\0' + session.parentSessionId;
-    if (!keys.has(parentKey)) continue;
-    const list = children.get(parentKey) ?? [];
-    list.push(session);
-    children.set(parentKey, list);
-  }
+  const children = sessionChildMap(sessions);
   const rows: Array<{ session: T; depth: number; childCount: number }> = [];
-  const walk = (session: T, depth: number) => {
-    const kids = children.get(sessionCollapseKey(session)) ?? [];
+  const walk = (session: T, depth: number, trail: ReadonlySet<string>) => {
+    const key = sessionCollapseKey(session);
+    if (trail.has(key)) return;
+    const nextTrail = new Set(trail);
+    nextTrail.add(key);
+    const kids = (children.get(key) ?? []).filter((child) => !nextTrail.has(sessionCollapseKey(child)));
     rows.push({ session, depth, childCount: kids.length });
-    if (kids.length && !collapsedIds.has(sessionCollapseKey(session))) {
-      for (const child of kids) walk(child, depth + 1);
+    if (kids.length && !collapsedIds.has(key)) {
+      for (const child of kids) walk(child, depth + 1, nextTrail);
     }
   };
-  for (const root of sessionRoots(sessions)) walk(root, 0);
+  for (const root of sessionRoots(sessions)) walk(root, 0, new Set());
   return rows;
 }
 
@@ -365,4 +454,16 @@ export function sessionsUnderRoots<T extends Pick<AnalysisSession, 'id' | 'provi
     }
   }
   return sessions.filter((session) => allowed.has(sessionCollapseKey(session)));
+}
+
+export function shouldHandleEscape(target: unknown): boolean {
+  if (!target || typeof target !== 'object' || !('closest' in target)) return true;
+  const closest = (target as { closest?: unknown }).closest;
+  if (typeof closest !== 'function') return true;
+  return !closest.call(target, 'input, textarea, select, [contenteditable="true"]');
+}
+
+export function trendChartMode(items: readonly { known: boolean }[]): 'empty' | 'unknown-only' | 'chart' {
+  if (!items.length) return 'empty';
+  return items.some((item) => item.known) ? 'chart' : 'unknown-only';
 }

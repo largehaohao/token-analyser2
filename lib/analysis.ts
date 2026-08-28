@@ -1389,7 +1389,7 @@ export function usageTokenCount(usage?: Usage): number {
   if (!usage) return 0;
   const cached = usage.cachedInputTokens ?? 0;
   const cacheCreation = usage.cacheCreationInputTokens ?? 0;
-  const input = usage.inputIncludesCached ? usage.inputTokens : usage.inputTokens + cached;
+  const input = usage.inputIncludesCached ? Math.max(usage.inputTokens, cached) : usage.inputTokens + cached;
   const reasoning = usage.outputIncludesReasoning ? 0 : (usage.reasoningTokens ?? 0);
   return input + cacheCreation + usage.outputTokens + reasoning;
 }
