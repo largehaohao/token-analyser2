@@ -9,19 +9,26 @@ import {
   callContentIndex,
   candidateShare,
   confidenceLabel,
+  costCaption,
   displayCost,
   formatCallAmount,
   formatGrowthRate,
+  formatSharePercent,
   paginate,
   SESSION_TIME_RANGES,
   sessionCollapseKey,
   sessionDisplayName,
+  sessionEntryCounts,
   sessionGrowthRate,
+  sessionIsActive,
+  sessionRoleLabel,
   sessionRoots,
   sessionsUnderRoots,
   sessionTreeRows,
   sessionsInTimeRange,
+  shouldHandleEscape,
   tokenComposition,
+  trendChartMode,
   type CallContent,
   type SessionTimeRange,
 } from '@/lib/session-view';
@@ -51,7 +58,6 @@ import {
   type AnalysisSession,
   type AnalysisResult,
   type Anomaly,
-  type CostSummary,
   type Provider,
   type RateSnapshot,
 } from '@/lib/analysis';
@@ -118,11 +124,11 @@ function eventLabel(event: AnalysisEvent): string {
   return '未知记录';
 }
 
-function metricSubtext(summary: CostSummary, currency: Currency): string {
-  const complete = currency === 'usd' ? summary.usdComplete : summary.creditsComplete;
-  if (complete && summary.hasKnownAmount) return '可追溯费率估算';
-  if (summary.hasKnownAmount) return '已知小计 · 仍有缺口';
-  return '等待可匹配费率';
+function TokenFigure({ value }: { value: number }) {
+  return <>
+    <span aria-hidden="true">{formatTokenCount(value)}</span>
+    <span className="visually-hidden">{formatExactTokenCount(value)}</span>
+  </>;
 }
 
 function compareDescending(left: number | undefined, right: number | undefined): number {
@@ -272,12 +278,12 @@ function EmptyState({
   );
 }
 
-function Pagination({ page, pageCount, total, start, end, onChange, label }: {
+function Pagination({ page, pageCount, total, start, end, onChange, label, unit = '条' }: {
   page: number; pageCount: number; total: number; start: number; end: number;
-  onChange: (page: number) => void; label: string;
+  onChange: (page: number) => void; label: string; unit?: string;
 }) {
   return <nav className="pagination" aria-label={label}>
-    <span role="status">第 {start}–{end} 条，共 {total} 条</span>
+    <span role="status">第 {start}–{end} {unit}，共 {total} {unit}</span>
     <div>
       <button className="button secondary" disabled={page <= 1} onClick={() => onChange(1)} aria-label="第一页">«</button>
       <button className="button secondary" disabled={page <= 1} onClick={() => onChange(page - 1)}>上一页</button>
@@ -384,7 +390,7 @@ function SessionCostTree({
           return (
             <div className="cost-tree-row cost-tree-leaf" key={item.key}>
               <span><i>│  ├─</i>{item.label}</span>
-              <b title={formatExactTokenCount(item.tokens)}>{item.percent}% · {formatTokenCount(item.tokens)}</b>
+              <b title={formatExactTokenCount(item.tokens)}>{formatSharePercent(item.percent, item.tokens)} · {formatTokenCount(item.tokens)}</b>
               <em>{cost.value}</em>
             </div>
           );
@@ -720,6 +726,7 @@ export default function Home() {
   useEffect(() => {
     function onKey(event: KeyboardEvent) {
       if (event.key !== 'Escape') return;
+      if (!shouldHandleEscape(event.target)) return;
       if (expandedCallId) {
         setExpandedCallId(null);
         event.preventDefault();
@@ -735,8 +742,8 @@ export default function Home() {
         event.preventDefault();
       }
     }
-    window.addEventListener('keydown', onKey, true);
-    return () => window.removeEventListener('keydown', onKey, true);
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
   }, [expandedCallId, selectedAnomalyId, selectedSessionId]);
 
   const visibleSessions = useMemo(() => {
@@ -751,6 +758,9 @@ export default function Home() {
         return compareDescending(left.inclusiveCost[currency], right.inclusiveCost[currency]);
       }
       if (sessionSort === 'growth') {
+        const leftActive = sessionIsActive(left);
+        const rightActive = sessionIsActive(right);
+        if (leftActive !== rightActive) return leftActive ? -1 : 1;
         return compareDescending(sessionGrowthRate(left), sessionGrowthRate(right));
       }
       return compareDescending(
@@ -851,13 +861,17 @@ export default function Home() {
 
   function renderSessionTable(sessions: AnalysisSession[]) {
     const rows = sessionTreeRows(sessions, collapsedSessionIds);
-    return <div className="table-wrap session-table-viewport"><table>
+    const present = new Set(sessions.map(sessionCollapseKey));
+    return <div className="table-wrap session-table-viewport"><table role="treegrid" aria-label="会话树">
       <thead><tr><th>目录 - Session</th><th>Agent</th><th>自身 Token</th><th>含子会话</th><th>预估费用</th><th>最近增速</th><th>Tools 字符</th><th>Skills 字符</th><th>最近数据</th></tr></thead>
       <tbody>{rows.length ? rows.map(({ session, depth, childCount }) => {
         const cost = displayCost(session.inclusiveCost, currency);
         const growth = sessionGrowthRate(session);
+        const active = sessionIsActive(session);
         const collapsed = collapsedSessionIds.has(sessionCollapseKey(session));
-        return <tr key={sessionCollapseKey(session)} className={depth ? 'child-session-row' : undefined}>
+        const parentPresent = Boolean(session.parentSessionId && present.has(session.provider + '\0' + session.parentSessionId));
+        const role = sessionRoleLabel(session, depth, { parentPresent });
+        return <tr key={sessionCollapseKey(session)} className={depth ? 'child-session-row' : undefined} role="row" aria-level={depth + 1} aria-expanded={childCount > 0 ? !collapsed : undefined}>
           <td>
             <div className={'session-name-cell' + (depth ? ' child-session' : '')} style={depth > 1 ? { paddingLeft: 22 + (depth - 1) * 16 } : undefined}>
               {childCount > 0
@@ -865,15 +879,15 @@ export default function Home() {
                 : <span className="tree-branch">{depth ? '└' : ''}</span>}
               <button className="session-link" title={sessionDisplayName(session)} onClick={() => openSession(session.id)}>
                 <strong>{sessionDisplayName(session)}</strong>
-                <small>{session.parentSessionId ? '子会话 · ' : '主会话 · '}{session.id}</small>
+                <small>{role} · {session.id}</small>
               </button>
             </div>
           </td>
           <td><SourceBadge provider={session.provider} /></td>
-          <td className="mono" title={formatExactTokenCount(session.ownUsage.totalTokens)}>{formatTokenCount(session.ownUsage.totalTokens)}</td>
-          <td className="mono" title={formatExactTokenCount(session.inclusiveUsage.totalTokens)}>{formatTokenCount(session.inclusiveUsage.totalTokens)}</td>
+          <td className="mono" title={formatExactTokenCount(session.ownUsage.totalTokens)} aria-label={formatExactTokenCount(session.ownUsage.totalTokens)}><TokenFigure value={session.ownUsage.totalTokens} /></td>
+          <td className="mono" title={formatExactTokenCount(session.inclusiveUsage.totalTokens)} aria-label={formatExactTokenCount(session.inclusiveUsage.totalTokens)}><TokenFigure value={session.inclusiveUsage.totalTokens} /></td>
           <td className={'mono cost-' + cost.tone} title={cost.note}>{cost.value}<small>{cost.note}</small></td>
-          <td className="mono" title={growth === undefined ? '调用不足两条或时间无效' : formatExactTokenCount(growth) + ' tokens / 分钟'}>{formatGrowthRate(growth)}</td>
+          <td className="mono" title={growth === undefined ? '调用不足两条或时间无效' : (active ? '' : '会话已结束 · ') + formatExactTokenCount(growth) + ' tokens / 分钟'}>{formatGrowthRate(growth, { active })}</td>
           {(['tools', 'skills'] as const).map((category) => {
             const snapshot = contextInventories.get(contextSessionKey(session.provider, session.id))?.[category]?.contextSnapshot;
             return <td key={category}><button className="context-length-link mono" title="最近记录的定义 / 目录字符数，点击查看组成；非 Token 用量" aria-label={category + ' 上下文 · ' + sessionDisplayName(session)} onClick={() => openSession(session.id, category)}>{snapshot ? snapshot.chars.toLocaleString('en-US') : '未知'}<small>查看组成 ↗</small></button></td>;
@@ -888,14 +902,9 @@ export default function Home() {
     if (!sessions.length) return <EmptyState title="当前范围内没有会话" description="请选择更长的时间范围、切换 Agent 或导入会话日志。" />;
     const roots = sessionRoots(sessions);
     const recentRoots = roots.slice(0, 8);
-    const allowed = new Set(recentRoots.flatMap((root) =>
-      sessions
-        .filter((session) => sessionCollapseKey(session) === sessionCollapseKey(root) || (session.parentSessionId === root.id && session.provider === root.provider))
-        .map(sessionCollapseKey),
-    ));
     return <>
-      {renderSessionTable(sessions.filter((session) => allowed.has(sessionCollapseKey(session))))}
-      {roots.length > recentRoots.length && <p className="table-more-note">已显示最近 {recentRoots.length} 个主会话（共 {roots.length} 个）。子会话按归属展开，不能再与含子会话合计相加。</p>}
+      {renderSessionTable(sessionsUnderRoots(sessions, recentRoots))}
+      {roots.length > recentRoots.length && <p className="table-more-note">已显示最近 {recentRoots.length} 个入口会话（共 {roots.length} 个）。子会话按归属展开，不能再与含子会话合计相加。</p>}
     </>;
   }
 
@@ -980,6 +989,15 @@ export default function Home() {
         }).join(', ')
       : '#273022 0% 100%';
     const behaviorTotal = behaviors.reduce((sum, item) => sum + item.tokens, 0);
+    const counts = sessionEntryCounts(sessions);
+    const chartMode = trendChartMode(trend);
+    const sessionCaption = [
+      completenessLabel(overviewAnalysis),
+      '主会话 ' + String(counts.primary),
+      counts.children ? '子会话 ' + String(counts.children) : '',
+      counts.detached ? String(counts.detached) + ' 个父会话不在范围内' : '',
+      sourceLabel,
+    ].filter(Boolean).join(' · ');
     return <><div className="session-date-filter overview-date-filter">
       <div className="segmented" role="group" aria-label="总览日期筛选">
         {[...SESSION_TIME_RANGES.slice(1), SESSION_TIME_RANGES[0]].map((range) => <button key={range.value} className={overviewTimeRange === range.value ? 'selected' : ''} aria-pressed={overviewTimeRange === range.value} onClick={() => { setOverviewTimeRange(range.value); setOverviewRangeNow(Date.now()); }}>{range.label}</button>)}
@@ -987,10 +1005,10 @@ export default function Home() {
       <p>按调用记录时间统计所选范围内的消耗，1 天为过去 24 小时；实时范围每分钟更新。{overviewTimeRange !== 'all' && '无有效时间的调用及整会话汇总费用不计入；进入会话详情可查看完整历史。'}</p>
     </div>
     <section className="metrics-grid">
-      <MetricCard label="预估总费用" value={overviewTotal.value} caption={overviewTotal.note + ' · ' + metricSubtext(overviewAnalysis.cost, currency)} icon="◈" title={overviewAnalysis.cost.basis} />
+      <MetricCard label="预估总费用" value={overviewTotal.value} caption={costCaption(overviewAnalysis.cost, currency)} icon="◈" title={overviewAnalysis.cost.basis} />
       <MetricCard label="总 Token 用量" value={formatTokenCount(overviewAnalysis.usage.totalTokens)} caption={formatExactTokenCount(overviewAnalysis.usage.totalTokens) + ' · ' + String(overviewAnalysis.calls.length) + ' 个模型调用'} icon="◎" title={'未缓存 ' + formatExactTokenCount(composition.uncached) + ' · 缓存 ' + formatExactTokenCount(composition.cached) + ' · 输出 ' + formatExactTokenCount(composition.output)} />
       <MetricCard label="疑似可优化费用" value={overviewCandidate.value} caption={share.percent === undefined ? share.note : String(share.percent) + '% ' + share.note} icon="↗" accent title="仅计入可计价的纯异常调用，混合与基线不在内" />
-      <MetricCard label="已分析会话" value={String(sessionRoots(sessions).length)} caption={completenessLabel(overviewAnalysis) + ' · 含子会话 ' + String(sessions.length)} icon="▤" />
+      <MetricCard label="已分析会话" value={String(counts.total)} caption={sessionCaption} icon="▤" />
     </section>
     <section className="charts-grid">
       <article className="panel trend-panel">
@@ -1008,7 +1026,7 @@ export default function Home() {
           <span><i className="legend-unknown" />费用未知</span>
           <span className="chart-unit">{trendMetric === 'tokens' ? 'tokens' : trendMetric === 'credits' ? 'credits' : 'USD'}</span>
         </div>
-        {trend.length ? <div className="bar-chart" aria-label="所选时间范围消耗趋势">
+        {chartMode === 'chart' ? <div className="bar-chart" aria-label="所选时间范围消耗趋势">
           <div className="bar-grid"><i /><i /><i /><i /><i /></div>
           <div className="bar-series" style={{ minWidth: trend.length * 38 }}>
             {trend.map((item) => {
@@ -1019,12 +1037,12 @@ export default function Home() {
               return <div className="bar-column-wrap" key={item.key} title={title}>
                 {item.known
                   ? <div className="bar-column" style={{ height: item.height + '%', minHeight: 0 }}><span className="bar-suspect" style={{ height: item.suspectHeight + '%' }} /><span className="bar-work" /></div>
-                  : <div className="bar-column bar-unknown" style={{ height: '18%' }} />}
+                  : <div className="bar-column bar-unknown" aria-label="费用未知" />}
                 <small>{item.label}</small>
               </div>;
             })}
           </div>
-        </div> : <EmptyState title="当前范围暂无可绘制数据" description="可切换 Tokens、延长时间范围或检查适用费率；未知费用不按零费用或 Credits 替代。" />}
+        </div> : <EmptyState title={chartMode === 'unknown-only' ? '当前范围费用未知' : '当前范围暂无可绘制数据'} description="可切换 Tokens、延长时间范围或检查适用费率；未知费用不按零费用或 Credits 替代。" />}
         <div className="chart-footnote"><span className="status-dot" />最后数据：{formatRelativeTime(overviewAnalysis.lastDataAt)}<button className="text-button" onClick={() => setView('sessions')}>查看每轮明细 ↗</button></div>
       </article>
       <article className="panel allocation-panel">
@@ -1033,12 +1051,12 @@ export default function Home() {
           <span className="info-icon" title="缓存读取不重复计入未缓存输入；推理已含在输出中时不再加一次">i</span>
         </div>
         <div className="allocation-content">
-          <div className="donut" style={{ background: 'conic-gradient(' + donut + ')' }} title={formatExactTokenCount(composition.total) + ' tokens'}>
-            <div><span>总用量</span><strong>{formatTokenCount(composition.total)}</strong><span>tokens</span></div>
+          <div className="donut" style={{ background: 'conic-gradient(' + donut + ')' }} title={formatExactTokenCount(overviewAnalysis.usage.totalTokens) + ' tokens'}>
+            <div><span>总用量</span><strong><TokenFigure value={overviewAnalysis.usage.totalTokens} /></strong><span>tokens</span></div>
           </div>
           <div className="allocation-legend">
             {composition.parts.filter((part) => part.tokens > 0 || composition.total === 0).map((part) => (
-              <div key={part.key}><span><i style={{ background: TOKEN_PART_COLORS[part.key] }} />{part.label}</span><strong title={formatExactTokenCount(part.tokens)}>{part.percent}<small>%</small></strong></div>
+              <div key={part.key}><span><i style={{ background: TOKEN_PART_COLORS[part.key] }} />{part.label}</span><strong title={formatExactTokenCount(part.tokens)}>{formatSharePercent(part.percent, part.tokens)}</strong></div>
             ))}
           </div>
         </div>
@@ -1046,12 +1064,12 @@ export default function Home() {
           <div className="behavior-stack-label">行为归因（推断，百分比合计 100%，不是账单分类）</div>
           <div className="behavior-bar">
             {behaviors.filter((item) => item.tokens > 0).map((item) => (
-              <span key={item.key} style={{ width: item.percent + '%', background: BEHAVIOR_COLORS[item.key] }} title={item.label + ' · ' + formatExactTokenCount(item.tokens) + ' · ' + String(item.percent) + '%'} />
+              <span key={item.key} style={{ width: item.percent + '%', background: BEHAVIOR_COLORS[item.key] }} title={item.label + ' · ' + formatExactTokenCount(item.tokens) + ' · ' + formatSharePercent(item.percent, item.tokens)} />
             ))}
           </div>
           <div className="behavior-legend">
             {behaviors.filter((item) => item.tokens > 0).map((item) => (
-              <span key={item.key}><i style={{ background: BEHAVIOR_COLORS[item.key] }} />{item.label} {item.percent}%</span>
+              <span key={item.key}><i style={{ background: BEHAVIOR_COLORS[item.key] }} />{item.label} {formatSharePercent(item.percent, item.tokens)}</span>
             ))}
             {!behaviorTotal && <span className="muted">暂无已记录用量</span>}
           </div>
@@ -1064,7 +1082,7 @@ export default function Home() {
       {overviewAnalysis.anomalies.length ? <div className="insight-grid">{overviewAnalysis.anomalies.slice(0, 3).map((anomaly) => <AnomalyCard key={anomaly.id} anomaly={anomaly} analysis={overviewAnalysis} currency={currency} onToggleNecessary={toggleNecessary} onSelect={() => { setSelectedAnomalyId(anomaly.id); setView('insights'); }} selected={selectedAnomalyId === anomaly.id} />)}</div> : <div className="panel"><EmptyState title="暂无已确认异常" description="满足完整证据条件的重复读取、轮询或压缩循环会在这里出现。" /></div>}
     </section>
     <section className="panel sessions-panel">
-      <div className="panel-heading"><div className="inline-heading"><h2>范围内最近会话</h2><span className="count-badge">{sessionRoots(sessions).length} 主会话</span></div><button className="text-button" onClick={() => { setSelectedSessionId(null); setView('sessions'); }}>查看所有会话 ↗</button></div>
+      <div className="panel-heading"><div className="inline-heading"><h2>范围内最近会话</h2><span className="count-badge">{counts.primary} 主会话</span></div><button className="text-button" onClick={() => { setSelectedSessionId(null); setView('sessions'); }}>查看所有会话 ↗</button></div>
       {renderSessionRows(sessions)}
     </section></>;
   }
@@ -1076,7 +1094,7 @@ export default function Home() {
     const pageSessions = sessionsUnderRoots(filteredSessions, page.items);
     if (!selectedSession) return <section className="view-stack">
       <div className="view-intro">
-        <div><span className="eyebrow">SESSION LEDGER</span><h2>会话记录</h2><p>按主会话分页，子会话可展开。点击名称进入详情；Esc 返回列表。</p></div>
+        <div><span className="eyebrow">SESSION LEDGER</span><h2>会话记录</h2><p>按入口会话分页（主会话，以及父会话不在范围内的子会话）。子会话可展开。点击名称进入详情；Esc 返回列表。</p></div>
         <label className="sort-control">排序<select aria-label="会话排序" value={sessionSort} onChange={(event) => { setSessionSort(event.target.value as SessionSort); setSessionPage(1); setSubagentPage(1); }}>
           <option value="updated">最近数据</option><option value="tokens">含子会话 Token</option><option value="cost">可计价费用</option><option value="growth">最近增速</option>
         </select></label>
@@ -1088,7 +1106,7 @@ export default function Home() {
         <p>按最后记录时间筛选，1 天为过去 24 小时；每分钟更新范围，不裁剪会话用量。</p>
       </div>
       <div className="panel sessions-panel">
-        <Pagination {...page} onChange={setSessionPage} label="会话列表分页" />
+        <Pagination {...page} onChange={setSessionPage} label="会话列表分页" unit="个入口会话" />
         {page.items.length || sessionTimeRange === 'all' ? renderSessionTable(pageSessions) : <EmptyState title="当前时间范围内没有会话" description="请选择更长的时间范围或“全部”。没有有效时间的会话仅在“全部”中显示。" />}
       </div>
     </section>;
@@ -1107,8 +1125,8 @@ export default function Home() {
           </div><SourceBadge provider={selectedSession.provider} />
         </div>
         <div className="detail-stats">
-          <div><span>自身 Token</span><strong title={formatExactTokenCount(selectedSession.ownUsage.totalTokens)}>{formatTokenCount(selectedSession.ownUsage.totalTokens)}</strong></div>
-          <div><span>含子会话 Token</span><strong title={formatExactTokenCount(selectedSession.inclusiveUsage.totalTokens)}>{formatTokenCount(selectedSession.inclusiveUsage.totalTokens)}</strong></div>
+          <div><span>自身 Token</span><strong aria-label={formatExactTokenCount(selectedSession.ownUsage.totalTokens)}><TokenFigure value={selectedSession.ownUsage.totalTokens} /></strong></div>
+          <div><span>含子会话 Token</span><strong aria-label={formatExactTokenCount(selectedSession.inclusiveUsage.totalTokens)}><TokenFigure value={selectedSession.inclusiveUsage.totalTokens} /></strong></div>
           <div><span>预估费用 · 含子会话</span><strong>{displayCost(selectedSession.inclusiveCost, currency).value}</strong><small>{displayCost(selectedSession.inclusiveCost, currency).note}</small></div>
         </div>
         <div className="detail-navigation" role="group" aria-label="会话详情分区">
@@ -1131,7 +1149,7 @@ export default function Home() {
           </div>{renderCallDetails(selectedSession.id)}
         </div>}
         {detailSection === 'children' && <div className="sessions-panel">
-          <Pagination {...childRows} onChange={setChildPage} label="直属子会话分页" />
+          <Pagination {...childRows} onChange={setChildPage} label="直属子会话分页" unit="个子会话" />
           {children.length ? renderSessionTable(childRows.items) : <EmptyState title="没有直属子会话" description="仅展示日志中有明确归属记录的子会话。" />}
         </div>}
         {detailSection === 'evidence' && <div className="compact-anomalies detail-scroll">
@@ -1151,7 +1169,7 @@ export default function Home() {
     const page = paginate(children, subagentPage, 15);
     return <section className="view-stack">
       <div className="view-intro"><div><span className="eyebrow">CHILD SESSIONS</span><h2>子 Agent</h2><p>每页 15 个子会话。仅按明确归属证据展示，不按目录或时间猜测关系。</p></div></div>
-      <div className="panel sessions-panel"><Pagination {...page} onChange={setSubagentPage} label="子 Agent 分页" />{renderSessionTable(page.items)}</div>
+      <div className="panel sessions-panel"><Pagination {...page} onChange={setSubagentPage} label="子 Agent 分页" unit="个子会话" />{renderSessionTable(page.items)}</div>
       <div className="panel callout-panel"><span className="callout-icon">i</span><div><strong>自身用量与含子会话合计是两个视图</strong><p>含子会话的费用不能再与子会话明细相加。</p></div></div>
     </section>;
   }
