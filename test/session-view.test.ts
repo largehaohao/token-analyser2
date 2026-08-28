@@ -243,6 +243,16 @@ test('growth sort ranks by window rate rather than wall-clock recency', () => {
   assert.ok((sessionGrowthRate(older) ?? 0) > (sessionGrowthRate(recent) ?? 0));
   assert.ok(compareSessionGrowth(older, recent) < 0);
   assert.ok(compareSessionGrowth(recent, older) > 0);
+  const recentSession = { id: 'recent', provider: 'codex' as const, parentSessionId: undefined, ...recent };
+  const olderSession = { id: 'older', provider: 'codex' as const, parentSessionId: undefined, ...older };
+  const sorted = [recentSession, olderSession].sort(compareSessionGrowth);
+  assert.deepEqual(sorted.map((session) => session.id), ['older', 'recent']);
+  const forest = sessionForest(sorted);
+  assert.deepEqual(forest.roots.map((session) => session.id), ['older', 'recent']);
+  assert.deepEqual(
+    sessionTreeRows(sorted, new Set(), forest).map((row) => row.session.id),
+    ['older', 'recent'],
+  );
 });
 
 test('displayCost does not present a missing rate as a billed zero', () => {
