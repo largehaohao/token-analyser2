@@ -822,6 +822,23 @@ test('overview includes exact time boundaries but excludes invalid, future and o
   assert.equal(scopeAnalysis(full, { since: Date.parse(iso(120)) }).sessions.length, 0);
 });
 
+test('scoped windows keep priced subtotals without filling unknown rates as zero', () => {
+  const full = buildAnalysis([
+    event({ id: 'priced', timestamp: iso(0), model: 'gpt-5.6-sol', usage: { inputTokens: 1_000_000, outputTokens: 0 } }),
+    event({ id: 'unpriced', timestamp: iso(60), model: 'unpriced-model', usage: { inputTokens: 1_000_000, outputTokens: 0 } }),
+  ], [{ ...rate, modelPattern: 'gpt-5.6-sol' }]);
+  assert.equal(full.cost.usdComplete, false);
+  assert.equal(full.cost.unknownCalls, 1);
+  const pricedWindow = scopeAnalysis(full, { since: Date.parse(iso(0)), until: Date.parse(iso(1)) });
+  assert.equal(pricedWindow.cost.usd, 1);
+  assert.equal(pricedWindow.cost.usdComplete, true);
+  assert.equal(pricedWindow.cost.unknownCalls, 0);
+  const unpricedWindow = scopeAnalysis(full, { since: Date.parse(iso(60)), until: Date.parse(iso(61)) });
+  assert.equal(unpricedWindow.cost.usd, undefined);
+  assert.equal(unpricedWindow.cost.hasKnownAmount, false);
+  assert.equal(unpricedWindow.cost.unknownCalls, 1);
+});
+
 test('overview preserves historical anomaly evidence but only prices in-window candidates', () => {
   const full = buildAnalysis([0, 60, 120].flatMap((seconds, index) => [
     event({ id: `window-call-${index}`, timestamp: iso(seconds), usage: { inputTokens: 1_000_000, outputTokens: 0 } }),

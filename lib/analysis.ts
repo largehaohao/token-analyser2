@@ -117,6 +117,8 @@ export interface CostSummary {
   credits?: number;
   usd?: number;
   complete: boolean;
+  usdComplete: boolean;
+  creditsComplete: boolean;
   hasKnownAmount: boolean;
   basis: string;
   knownCalls: number;
@@ -1570,11 +1572,15 @@ function calculateCost(
     }
   }
   const hasKnownAmount = creditsKnownCalls > 0 || usdKnownCalls > 0;
+  const usdComplete = unknownCalls === 0 && usdKnown;
+  const creditsComplete = unknownCalls === 0 && creditsKnown;
   if (knownCalls === 0 && unknownCalls === 0) {
     return {
       credits: 0,
       usd: 0,
       complete: true,
+      usdComplete: true,
+      creditsComplete: true,
       hasKnownAmount: false,
       basis: '没有可计价调用',
       knownCalls: 0,
@@ -1585,7 +1591,9 @@ function calculateCost(
   return {
     credits: creditsKnownCalls > 0 ? creditsKnownAmount : undefined,
     usd: usdKnownCalls > 0 ? usdKnownAmount : undefined,
-    complete: unknownCalls === 0 && creditsKnown && usdKnown,
+    complete: usdComplete && creditsComplete,
+    usdComplete,
+    creditsComplete,
     hasKnownAmount,
     basis: basis.size ? [...basis].join('；') : '暂无适用费率',
     knownCalls,
@@ -2160,6 +2168,7 @@ export function scopeAnalysis(
   const events = analysis.events.filter(matches);
   // A session-wide reported bill cannot be allocated to a smaller time window.
   const reportedSummaries = hasWindow ? [] : events.filter((event) => event.kind === 'model' && event.scope === 'summary');
+  const cost = calculateCost(calls, analysis.rates, reportedSummaries);
   return {
     ...analysis,
     events,
@@ -2167,10 +2176,11 @@ export function scopeAnalysis(
     sessions: createSessions(calls, analysis.rates),
     anomalies,
     usage: calls.reduce((summary, call) => addUsage(summary, call.usage), emptyUsage()),
-    cost: calculateCost(calls, analysis.rates, reportedSummaries),
+    cost,
     candidateCost: candidateCost(anomalies, calls, analysis.rates, analysis.necessaryCallIds),
     lastDataAt: calls.filter((call) => Number.isFinite(Date.parse(call.timestamp)))
       .reduce<string | undefined>((latest, call) => !latest || Date.parse(call.timestamp) > Date.parse(latest) ? call.timestamp : latest, undefined),
+    completeness: hasUnknownData(events, analysis.errors) ? 'partial' : 'complete',
   };
 }
 
@@ -2349,9 +2359,19 @@ export function createDemoAnalysis(): AnalysisResult {
 }
 
 export function formatTokenCount(value: number): string {
-  if (value >= 1_000_000) return (value / 1_000_000).toFixed(value >= 10_000_000 ? 1 : 2) + 'M';
-  if (value >= 1_000) return (value / 1_000).toFixed(value >= 100_000 ? 0 : 1) + 'K';
-  return Math.round(value).toLocaleString('zh-CN');
+  if (!Number.isFinite(value)) return '未知';
+  if (value === 0) return '0';
+  const sign = value < 0 ? '-' : '';
+  const abs = Math.abs(value);
+  if (abs < 1) return sign + '<1';
+  if (abs >= 1_000_000) return sign + (abs / 1_000_000).toFixed(abs >= 10_000_000 ? 1 : 2) + 'M';
+  if (abs >= 1_000) return sign + (abs / 1_000).toFixed(abs >= 100_000 ? 0 : 1) + 'K';
+  return sign + Math.round(abs).toLocaleString('zh-CN');
+}
+
+export function formatExactTokenCount(value: number): string {
+  if (!Number.isFinite(value)) return '未知';
+  return value.toLocaleString('zh-CN');
 }
 
 export function formatMoney(value: number | undefined, currency = 'USD'): string {

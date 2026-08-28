@@ -1,7 +1,25 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { callContentIndex, formatCallAmount, paginate, SESSION_TIME_RANGES, sessionDisplayName, sessionsInTimeRange, tokenComposition } from '../lib/session-view';
-import { buildAnalysis, parseJsonl } from '../lib/analysis';
+import {
+  aggregateTokenComposition,
+  behaviorShares,
+  callContentIndex,
+  candidateShare,
+  displayCost,
+  formatCallAmount,
+  formatGrowthRate,
+  paginate,
+  SESSION_TIME_RANGES,
+  sessionDisplayName,
+  sessionGrowthRate,
+  sessionRoots,
+  sessionsUnderRoots,
+  sessionTreeRows,
+  sessionsInTimeRange,
+  sharePercents,
+  tokenComposition,
+} from '../lib/session-view';
+import { buildAnalysis, formatExactTokenCount, formatTokenCount, parseJsonl, type AnalysisEvent, type CostSummary } from '../lib/analysis';
 
 test('session labels use directory basename and explicit title with honest fallbacks', () => {
   assert.equal(sessionDisplayName({ id: 'abc', title: '优化 UI', cwd: '/projects/token-analyser2/' }), 'token-analyser2 - 优化 UI');
@@ -102,3 +120,152 @@ test('Claude reply content is extracted from message.content and bounded without
   assert.equal(result.calls.length, 1);
   assert.equal(result.usage.totalTokens, 30);
 });
+
+test('share percents use largest remainder so mutually exclusive slices sum to 100', () => {
+  assert.deepEqual(sharePercents([1, 1, 1]), [34, 33, 33]);
+  assert.equal(sharePercents([1, 1, 1]).reduce((sum, value) => sum + value, 0), 100);
+  assert.deepEqual(sharePercents([0, 0, 0]), [0, 0, 0]);
+  assert.deepEqual(sharePercents([10, 0]), [100, 0]);
+});
+
+test('behavior shares keep mixed and unknown out of the other bucket', () => {
+  const shares = behaviorShares([
+    { behavior: 'code', usage: { inputTokens: 60, outputTokens: 0 } },
+    { behavior: 'mixed', usage: { inputTokens: 30, outputTokens: 0 } },
+    { behavior: 'unknown', usage: { inputTokens: 10, outputTokens: 0 } },
+  ] as AnalysisEvent[]);
+  assert.equal(shares.find((item) => item.key === 'code')?.tokens, 60);
+  assert.equal(shares.find((item) => item.key === 'mixed')?.tokens, 30);
+  assert.equal(shares.find((item) => item.key === 'unknown')?.tokens, 10);
+  assert.equal(shares.find((item) => item.key === 'other')?.tokens, 0);
+  assert.equal(shares.reduce((sum, item) => sum + item.percent, 0), 100);
+});
+
+test('token composition aggregates calls without treating cached input as extra uncached tokens', () => {
+  const composition = aggregateTokenComposition([
+    { usage: { inputTokens: 100, cachedInputTokens: 80, inputIncludesCached: true, outputTokens: 20, reasoningTokens: 5, outputIncludesReasoning: true } },
+    { usage: { inputTokens: 50, cachedInputTokens: 10, cacheCreationInputTokens: 5, outputTokens: 8 } },
+  ] as AnalysisEvent[]);
+  assert.equal(composition.uncached, 70);
+  assert.equal(composition.cached, 90);
+  assert.equal(composition.cacheWrite, 5);
+  assert.equal(composition.output, 28);
+  assert.equal(composition.total, 193);
+  assert.equal(composition.parts.reduce((sum, part) => sum + part.percent, 0), 100);
+});
+
+test('session growth uses a recent window instead of the last two noisy calls', () => {
+  const iso = (minutes: number) => new Date(Date.UTC(2026, 7, 28, 12, minutes)).toISOString();
+  const session = {
+    lastDataAt: iso(20),
+    ownCalls: [
+      { timestamp: iso(0), usage: { inputTokens: 1_000_000, outputTokens: 0 } },
+      { timestamp: iso(1), usage: { inputTokens: 1, outputTokens: 0 } },
+      { timestamp: iso(20), usage: { inputTokens: 15_000, outputTokens: 0 } },
+    ] as AnalysisEvent[],
+  };
+  const rate = sessionGrowthRate(session);
+  assert.ok(rate !== undefined);
+  assert.ok(Math.abs((rate ?? 0) - 1000) < 1e-6);
+  assert.equal(formatGrowthRate(undefined), '—');
+  assert.equal(formatGrowthRate(0.4), '<1 / 分钟');
+});
+
+test('displayCost does not present a missing rate as a billed zero', () => {
+  const empty: CostSummary = {
+    usd: 0,
+    credits: 0,
+    complete: true,
+    usdComplete: true,
+    creditsComplete: true,
+    hasKnownAmount: false,
+    basis: '没有可计价调用',
+    knownCalls: 0,
+    unknownCalls: 0,
+    breakdown: { inputTokens: 0, cachedInputTokens: 0, cacheCreationInputTokens: 0, outputTokens: 0 },
+  };
+  const missing: CostSummary = {
+    complete: false,
+    usdComplete: false,
+    creditsComplete: false,
+    hasKnownAmount: false,
+    basis: '暂无适用费率',
+    knownCalls: 0,
+    unknownCalls: 2,
+    breakdown: { inputTokens: 10, cachedInputTokens: 0, cacheCreationInputTokens: 0, outputTokens: 1 },
+  };
+  const partial: CostSummary = {
+    usd: 1.23,
+    complete: false,
+    usdComplete: false,
+    creditsComplete: false,
+    hasKnownAmount: true,
+    basis: '已知小计',
+    knownCalls: 1,
+    unknownCalls: 1,
+    breakdown: { inputTokens: 10, cachedInputTokens: 0, cacheCreationInputTokens: 0, outputTokens: 1 },
+  };
+  assert.equal(displayCost(empty, 'usd').value, '$0.00');
+  assert.equal(displayCost(empty, 'usd').note, '没有可计价调用');
+  assert.equal(displayCost(missing, 'usd').value, '未知');
+  assert.equal(displayCost(missing, 'usd').tone, 'unknown');
+  assert.equal(displayCost(partial, 'usd').tone, 'partial');
+  assert.equal(displayCost(partial, 'usd').note, 'USD 已知小计');
+  assert.equal(displayCost({ ...partial, usdComplete: true, unknownCalls: 0 }, 'usd').tone, 'known');
+  assert.equal(displayCost({ ...partial, usdComplete: true, unknownCalls: 0 }, 'usd').note, 'USD 估算');
+});
+
+test('candidate share never fills an unknown cost with zero to invent a percentage', () => {
+  const known: CostSummary = {
+    usd: 10,
+    complete: true,
+    usdComplete: true,
+    creditsComplete: true,
+    hasKnownAmount: true,
+    basis: 'test',
+    knownCalls: 2,
+    unknownCalls: 0,
+    breakdown: { inputTokens: 0, cachedInputTokens: 0, cacheCreationInputTokens: 0, outputTokens: 0 },
+  };
+  const unknown: CostSummary = {
+    complete: false,
+    usdComplete: false,
+    creditsComplete: false,
+    hasKnownAmount: false,
+    basis: '暂无适用费率',
+    knownCalls: 0,
+    unknownCalls: 1,
+    breakdown: { inputTokens: 0, cachedInputTokens: 0, cacheCreationInputTokens: 0, outputTokens: 0 },
+  };
+  assert.equal(candidateShare(known, { ...known, usd: 2.4 }, 'usd').percent, 24);
+  assert.equal(candidateShare(known, unknown, 'usd').percent, undefined);
+  assert.match(candidateShare(known, unknown, 'usd').note, /无法计算占比/);
+});
+
+test('session tree expands children under the matching provider parent', () => {
+  const parent = { id: 'main', provider: 'codex' as const, parentSessionId: undefined };
+  const child = { id: 'child', provider: 'codex' as const, parentSessionId: 'main' };
+  const other = { id: 'main', provider: 'claude' as const, parentSessionId: undefined };
+  const expanded = sessionTreeRows([parent, child, other], new Set());
+  assert.deepEqual(expanded.map((row) => [row.session.provider, row.session.id, row.depth, row.childCount]), [
+    ['codex', 'main', 0, 1],
+    ['codex', 'child', 1, 0],
+    ['claude', 'main', 0, 0],
+  ]);
+  const collapsed = sessionTreeRows([parent, child], new Set(['codex\0main']));
+  assert.equal(collapsed.length, 1);
+  assert.deepEqual(sessionRoots([parent, child, other]).map((session) => session.provider + ':' + session.id), ['codex:main', 'claude:main']);
+  const grandchild = { id: 'grandchild', provider: 'codex' as const, parentSessionId: 'child' };
+  assert.deepEqual(
+    sessionsUnderRoots([parent, child, grandchild, other], [parent]).map((session) => session.id),
+    ['main', 'child', 'grandchild'],
+  );
+});
+
+test('token count formatting distinguishes unknown, zero, and sub-one values', () => {
+  assert.equal(formatTokenCount(0), '0');
+  assert.equal(formatTokenCount(0.4), '<1');
+  assert.equal(formatTokenCount(Number.NaN), '未知');
+  assert.equal(formatExactTokenCount(12345).replace(/\D/g, ''), '12345');
+});
+
