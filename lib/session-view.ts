@@ -332,16 +332,16 @@ export function displayCost(
   }
   if (currency === 'usd' && summary.credits !== undefined) {
     return {
-      value: formatMoney(summary.credits, 'credits'),
+      value: '未知',
       note: 'USD 费率未知 · credits 估算',
-      tone: 'partial',
+      tone: 'unknown',
     };
   }
   if (currency === 'credits' && summary.usd !== undefined) {
     return {
-      value: formatMoney(summary.usd, 'USD'),
+      value: '未知',
       note: 'credits 费率未知 · USD 估算',
-      tone: 'partial',
+      tone: 'unknown',
     };
   }
   return {
@@ -384,8 +384,6 @@ function amountForDisplay(
 ): { value: number; unit: 'usd' | 'credits' } | undefined {
   if (currency === 'usd' && summary.usd !== undefined) return { value: summary.usd, unit: 'usd' };
   if (currency === 'credits' && summary.credits !== undefined) return { value: summary.credits, unit: 'credits' };
-  if (currency === 'usd' && summary.credits !== undefined) return { value: summary.credits, unit: 'credits' };
-  if (currency === 'credits' && summary.usd !== undefined) return { value: summary.usd, unit: 'usd' };
   return undefined;
 }
 

@@ -364,8 +364,45 @@ test('candidate share never fills an unknown cost with zero to invent a percenta
     breakdown: { inputTokens: 0, cachedInputTokens: 0, cacheCreationInputTokens: 0, outputTokens: 0 },
   };
   const creditsShare = candidateShare(creditsOnly, { ...creditsOnly, credits: 10 }, 'usd');
-  assert.equal(creditsShare.percent, 20);
-  assert.match(creditsShare.note, /credits/);
+  assert.equal(creditsShare.percent, undefined);
+  assert.match(creditsShare.note, /无法计算占比/);
+  const sameUnit = candidateShare(creditsOnly, { ...creditsOnly, credits: 10 }, 'credits');
+  assert.equal(sameUnit.percent, 20);
+  assert.match(sameUnit.note, /credits/);
+});
+
+test('displayCost keeps the selected unit in the headline when the other unit is the only known amount', () => {
+  const usdOnly: CostSummary = {
+    usd: 10.35,
+    complete: false,
+    usdComplete: true,
+    creditsComplete: false,
+    hasKnownAmount: true,
+    basis: 'USD 估算',
+    knownCalls: 2,
+    unknownCalls: 0,
+    breakdown: { inputTokens: 0, cachedInputTokens: 0, cacheCreationInputTokens: 0, outputTokens: 0 },
+  };
+  const creditsView = displayCost(usdOnly, 'credits');
+  assert.equal(creditsView.value, '未知');
+  assert.equal(creditsView.tone, 'unknown');
+  assert.equal(creditsView.note, 'credits 费率未知 · USD 估算');
+  assert.equal(costCaption(usdOnly, 'credits'), 'credits 费率未知 · USD 估算');
+  const creditsOnly: CostSummary = {
+    credits: 50,
+    complete: false,
+    usdComplete: false,
+    creditsComplete: true,
+    hasKnownAmount: true,
+    basis: 'credits',
+    knownCalls: 2,
+    unknownCalls: 0,
+    breakdown: { inputTokens: 0, cachedInputTokens: 0, cacheCreationInputTokens: 0, outputTokens: 0 },
+  };
+  const usdView = displayCost(creditsOnly, 'usd');
+  assert.equal(usdView.value, '未知');
+  assert.equal(usdView.note, 'USD 费率未知 · credits 估算');
+  assert.equal(displayCost(usdOnly, 'usd').value, '$10.35');
 });
 
 test('session tree expands children under the matching provider parent', () => {
