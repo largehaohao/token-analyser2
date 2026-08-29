@@ -924,7 +924,15 @@ export default function Home() {
       : collectorConnection === 'loading' ? 'warn'
         : collectorConnection === 'stopped' ? 'quiet'
           : 'idle';
-  const freshnessKind = freshness === 'live' ? 'live' : freshness === 'quiet' ? 'quiet' : freshness === 'stale' ? 'stale' : 'unknown';
+  const freshnessReady = clockMs > 0;
+  const freshnessKind = !freshnessReady ? 'unknown'
+    : freshness === 'live' ? 'live'
+      : freshness === 'quiet' ? 'quiet'
+        : freshness === 'stale' ? 'stale'
+          : 'unknown';
+  const freshnessChipLabel = !freshnessReady
+    ? (analysis.lastDataAt ? '最后数据 ' + formatRelativeTime(analysis.lastDataAt) : '尚无数据时间')
+    : dataFreshnessLabel(freshness, collectorStatus === 'collecting');
   function openSession(session: AnalysisSession, context?: ContextCategory, section?: typeof detailSection) {
     setExpandedCallId(null);
     setSelectedSessionKey(sessionCollapseKey(session));
@@ -986,7 +994,7 @@ export default function Home() {
           <td className="mono" title={formatExactTokenCount(session.inclusiveUsage.totalTokens)} aria-label={formatExactTokenCount(session.inclusiveUsage.totalTokens)}><TokenFigure value={session.inclusiveUsage.totalTokens} /></td>
           <td className={'mono cost-' + cost.tone} title={cost.note}>{cost.value}<small>{cost.note}</small></td>
           <td className={'mono growth-cell' + (growth.badge === '当前' ? ' growth-live' : '')} title={growth.caption} aria-label={growth.caption}>
-            {growth.badge && <span className={'growth-badge growth-' + (growth.badge === '当前' ? 'live' : 'past')}>{growth.badge}</span>}
+            {clockMs > 0 && growth.badge && <span className={'growth-badge growth-' + (growth.badge === '当前' ? 'live' : 'past')}>{growth.badge}</span>}
             {growth.value}
           </td>
           {(['tools', 'skills'] as const).map((category) => {
@@ -1415,7 +1423,7 @@ export default function Home() {
               </div>
               <div className="status-cluster" aria-label="采集与数据状态">
                 <StatusChip kind={connectionKind} label={collectorConnectionLabel(collectorConnection)} title={collectorMessage} />
-                <StatusChip kind={freshnessKind} label={dataFreshnessLabel(freshness, collectorStatus === 'collecting')} title={'最后数据 ' + formatRelativeTime(analysis.lastDataAt)} />
+                <StatusChip kind={freshnessKind} label={freshnessChipLabel} title={'最后数据 ' + formatRelativeTime(analysis.lastDataAt)} />
                 <StatusChip kind={analysis.completeness === 'complete' ? 'ok' : analysis.completeness === 'partial' ? 'warn' : 'unknown'} label={completenessLabel(analysis)} />
               </div>
             </div>
