@@ -1,13 +1,40 @@
 import { sites } from '@openai/sites-vite-plugin';
 import tailwindcss from '@tailwindcss/postcss';
 import vinext from 'vinext';
-import { defineConfig } from 'vite';
-import hostingConfig from './.openai/hosting.json';
+import { defineConfig, type Plugin } from 'vite';
+import hostingJson from './.openai/hosting.json';
+import { attachExtraLoopback } from './lib/loopback-bind';
 
 const SITE_CREATOR_PLACEHOLDER_DATABASE_ID =
   '00000000-0000-4000-8000-000000000000';
 
+const hostingConfig = hostingJson as { d1?: string; r2?: string };
 const { d1, r2 } = hostingConfig;
+
+/** Keep localhost and 127.0.0.1 working without exposing 0.0.0.0. */
+function loopbackDualBindPlugin(): Plugin {
+  return {
+    name: 'token-scope-loopback-dual-bind',
+    apply: 'serve',
+    configureServer(server) {
+      const httpServer = server.httpServer;
+      if (!httpServer) return;
+      const bindExtra = () => {
+        void attachExtraLoopback(httpServer, server.middlewares as import('node:http').RequestListener).then((extra) => {
+          if (!extra) return;
+          const closeExtra = () => extra.close();
+          if (!httpServer.listening) {
+            closeExtra();
+            return;
+          }
+          httpServer.once('close', closeExtra);
+        });
+      };
+      if (httpServer.listening) bindExtra();
+      else httpServer.once('listening', bindExtra);
+    },
+  };
+}
 
 // macOS Seatbelt blocks FSEvents, so Codex previews need polling for HMR.
 const isCodexSeatbeltSandbox = process.env.CODEX_SANDBOX === 'seatbelt';
@@ -50,6 +77,7 @@ export default defineConfig(async () => {
       ? { watch: { useFsEvents: false, usePolling: true } }
       : undefined,
     plugins: [
+      loopbackDualBindPlugin(),
       vinext(),
       sites(),
       cloudflare({
