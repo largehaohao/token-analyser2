@@ -86,6 +86,40 @@ export interface ParsedJsonl {
   updatedExisting?: boolean;
 }
 
+export interface ParseContinuationState {
+  seenUsageSessions: Set<string>;
+  sessionParents: Map<string, string>;
+  sessionServiceTiers: Map<string, 'standard' | 'fast' | 'unknown'>;
+  tokenTotals: Map<string, Usage>;
+  replayBoundarySessions: Set<string>;
+  pendingReplayEvents: Map<string, AnalysisEvent[]>;
+  latestUserRequests: Map<string, string>;
+}
+
+export function createParseContinuationState(): ParseContinuationState {
+  return {
+    seenUsageSessions: new Set(),
+    sessionParents: new Map(),
+    sessionServiceTiers: new Map(),
+    tokenTotals: new Map(),
+    replayBoundarySessions: new Set(),
+    pendingReplayEvents: new Map(),
+    latestUserRequests: new Map(),
+  };
+}
+
+export function cloneParseContinuationState(state: ParseContinuationState): ParseContinuationState {
+  return {
+    seenUsageSessions: new Set(state.seenUsageSessions),
+    sessionParents: new Map(state.sessionParents),
+    sessionServiceTiers: new Map(state.sessionServiceTiers),
+    tokenTotals: new Map([...state.tokenTotals].map(([key, usage]) => [key, { ...usage }])),
+    replayBoundarySessions: new Set(state.replayBoundarySessions),
+    pendingReplayEvents: new Map([...state.pendingReplayEvents].map(([key, events]) => [key, [...events]])),
+    latestUserRequests: new Map(state.latestUserRequests),
+  };
+}
+
 export interface ParseError {
   line: number;
   message: string;
@@ -220,6 +254,7 @@ interface ParseOptions {
   lineOffset?: number;
   pendingOutputs?: Map<string, string>;
   toolEvents?: Map<string, AnalysisEvent>;
+  continuation?: ParseContinuationState;
 }
 
 type JsonRecord = Record<string, unknown>;
@@ -496,6 +531,11 @@ function normalizeProvider(value: unknown, sourceFile: string): Provider {
   }
   if (isRecord(value)) {
     const type = stringValue(value.type, value.event, value.subtype)?.toLowerCase() ?? '';
+    const message = firstRecord(value.message, isRecord(value.payload) ? value.payload.message : undefined);
+    const payload = firstRecord(value.payload);
+    const model = stringValue(value.model, message?.model, payload?.model)?.toLowerCase() ?? '';
+    if (model.includes('claude')) return 'claude';
+    if (model.includes('codex') || model.startsWith('gpt-') || /^o\d/.test(model)) return 'codex';
     const serialized = JSON.stringify(value).toLowerCase();
     // Generic filenames are common for native logs. Use stable protocol
     // fields to infer the source without treating prompt text as metadata.
@@ -932,8 +972,9 @@ export function parseJsonl(text: string, options: ParseOptions): ParsedJsonl {
   const fallbackSession = options.sessionId ?? (sourceFile.replace(/\.[^.]+$/, '') || 'session');
   let provider = options.provider ?? normalizeProvider(undefined, sourceFile);
   let latestSession = fallbackSession;
-  let latestUserRequest: string | undefined;
-  const seenUsageSessions = new Set<string>();
+  const latestUserRequests = options.continuation?.latestUserRequests ?? new Map<string, string>();
+  let latestUserRequest = latestUserRequests.get(fallbackSession);
+  const seenUsageSessions = options.continuation?.seenUsageSessions ?? new Set<string>();
   const toolEvents = options.toolEvents ?? new Map<string, AnalysisEvent>();
   const pendingOutputs = options.pendingOutputs ?? new Map<string, string>();
   const priorToolIds = new Set(toolEvents.keys());
@@ -942,12 +983,12 @@ export function parseJsonl(text: string, options: ParseOptions): ParsedJsonl {
   const sessionDirectories = new Map<string, string>();
   if (options.sessionId && options.cwd) sessionDirectories.set(options.sessionId, options.cwd);
   if (options.sessionId && options.sessionTitle) sessionTitles.set(options.sessionId, options.sessionTitle);
-  const sessionParents = new Map<string, string>();
+  const sessionParents = options.continuation?.sessionParents ?? new Map<string, string>();
   const sessionModels = new Map<string, string>();
-  const sessionServiceTiers = new Map<string, 'standard' | 'fast' | 'unknown'>();
-  const tokenTotals = new Map<string, Usage>();
-  const replayActive = new Map<string, boolean>();
-  const hasCodexReplayBoundary = /"(?:type|event)"\s*:\s*"(?:task_started|inter_agent_communication(?:_metadata)?)"/.test(text);
+  const sessionServiceTiers = options.continuation?.sessionServiceTiers ?? new Map<string, 'standard' | 'fast' | 'unknown'>();
+  const tokenTotals = options.continuation?.tokenTotals ?? new Map<string, Usage>();
+  const replayBoundarySessions = options.continuation?.replayBoundarySessions ?? new Set<string>();
+  const pendingReplayEvents = options.continuation?.pendingReplayEvents ?? new Map<string, AnalysisEvent[]>();
   if (options.sessionId && options.model) sessionModels.set(options.sessionId, options.model);
   const hasTrailingNewline = /\r?\n$/.test(text);
   const lineOffset = options.lineOffset ?? 0;
@@ -975,6 +1016,7 @@ export function parseJsonl(text: string, options: ParseOptions): ParsedJsonl {
     const type = recordType(record);
     provider = options.provider ?? (provider === 'unknown' ? normalizeProvider(record, sourceFile) : provider);
     const sessionId = options.sessionId ?? findSessionId(record, latestSession);
+    if (sessionId !== latestSession) latestUserRequest = latestUserRequests.get(sessionId);
     latestSession = sessionId;
     const parentSessionId = findParentSessionId(record);
     const actorId = findActorId(record, sessionId);
@@ -1003,14 +1045,19 @@ export function parseJsonl(text: string, options: ParseOptions): ParsedJsonl {
     const payloadType = stringValue(payload.type, payload.event, payload.subtype)?.toLowerCase() ?? '';
     const discoveredTier = serviceTierFromRecord(record);
     if (discoveredTier) sessionServiceTiers.set(sessionId, discoveredTier);
-    if (provider === 'codex' && hasCodexReplayBoundary && resolvedParent && !replayActive.has(sessionId)) {
-      replayActive.set(sessionId, true);
-    }
     const replayBoundary = payloadType === 'task_started' || (
       /inter_agent_communication(?:_metadata)?/.test(type + ' ' + payloadType) &&
       (record.trigger_turn === true || payload.trigger_turn === true)
     );
-    if (replayBoundary) replayActive.set(sessionId, false);
+    if (provider === 'codex' && replayBoundary) {
+      replayBoundarySessions.add(sessionId);
+      const replayCandidates = pendingReplayEvents.get(sessionId) ?? [];
+      if (resolvedParent && replayCandidates.length) {
+        for (const candidate of replayCandidates) candidate.replayed = true;
+        if (replayCandidates.some((candidate) => candidate.sourceLine <= lineOffset)) updatedExisting = true;
+      }
+      pendingReplayEvents.delete(sessionId);
+    }
     const message = nestedRecord(record, 'message');
     for (const [index, contextSnapshot] of extractContextSnapshots(record).entries()) {
       events.push(makeEvent({ id: sourceFile + ':context:' + String(lineIndex + 1 + lineOffset) + ':' + index, ...base }, {
@@ -1037,6 +1084,7 @@ export function parseJsonl(text: string, options: ParseOptions): ParsedJsonl {
     const toolResultOnly = explicitUser && isToolResultOnly(record);
     if (explicitUser && !toolResultOnly) {
       latestUserRequest = callId ?? sourceFile + ':request:' + String(lineIndex + 1 + lineOffset);
+      latestUserRequests.set(sessionId, latestUserRequest);
       events.push(
         makeEvent(
           {
@@ -1217,27 +1265,30 @@ export function parseJsonl(text: string, options: ParseOptions): ParsedJsonl {
       if (isTokenSnapshot) usage.cumulative = snapshot.cumulative;
       usage.inputIncludesCached = provider === 'codex';
       const usageId = callId ?? sourceFile + ':model:' + String(lineIndex + 1 + lineOffset);
-      events.push(
-        makeEvent(
-          {
-            id: usageId,
-            ...base,
-          },
-          {
-            kind: 'model',
-            callId: usageId,
-            userRequestId: latestUserRequest,
-            model,
-            usage,
-            text: assistantText,
-            scope: isTokenSnapshot ? 'tree' : 'call',
-            behavior: classifyModelBehavior(toolUses),
-            replayed: provider === 'codex' && replayActive.get(sessionId) === true,
-            serviceTier: sessionServiceTiers.get(sessionId),
-            rawType: type,
-          },
-        ),
+      const modelEvent = makeEvent(
+        {
+          id: usageId,
+          ...base,
+        },
+        {
+          kind: 'model',
+          callId: usageId,
+          userRequestId: latestUserRequest,
+          model,
+          usage,
+          text: assistantText,
+          scope: isTokenSnapshot ? 'tree' : 'call',
+          behavior: classifyModelBehavior(toolUses),
+          serviceTier: sessionServiceTiers.get(sessionId),
+          rawType: type,
+        },
       );
+      events.push(modelEvent);
+      if (provider === 'codex' && resolvedParent && !replayBoundarySessions.has(sessionId)) {
+        const replayCandidates = pendingReplayEvents.get(sessionId) ?? [];
+        replayCandidates.push(modelEvent);
+        pendingReplayEvents.set(sessionId, replayCandidates);
+      }
       for (const toolEvent of toolsThisLine) toolEvent.modelCallId = usageId;
       seenUsageSessions.add(provider + ':' + sessionId);
     }
@@ -1268,6 +1319,7 @@ export function parseJsonl(text: string, options: ParseOptions): ParsedJsonl {
   }
 
   for (const event of events) {
+    if (event.provider === 'unknown' && provider !== 'unknown') event.provider = provider;
     if (!event.sessionTitle) event.sessionTitle = sessionTitles.get(event.sessionId);
     if (!event.cwd) event.cwd = sessionDirectories.get(event.sessionId);
     if (!event.parentSessionId) event.parentSessionId = sessionParents.get(event.sessionId);
