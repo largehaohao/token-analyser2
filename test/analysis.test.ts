@@ -594,6 +594,21 @@ test('infers Claude Code from native cache fields when the filename is generic',
   assert.equal(parsed.events.find((item) => item.kind === 'model')?.provider, 'claude');
 });
 
+test('infers Codex from a native model field when the filename is generic', () => {
+  const parsed = parseJsonl(JSON.stringify({
+    type: 'assistant',
+    session_id: 'generic-codex-session',
+    message: {
+      id: 'generic-codex-call',
+      model: 'gpt-5.6-sol',
+      usage: { input_tokens: 10, output_tokens: 2 },
+    },
+  }), { sourceFile: 'session.jsonl' });
+
+  assert.equal(parsed.provider, 'codex');
+  assert.equal(parsed.events.find((item) => item.kind === 'model')?.provider, 'codex');
+});
+
 test('parses the checked-in Claude fixture with cached and tool evidence', async () => {
   const { readFile } = await import('node:fs/promises');
   const parsed = parseJsonl(await readFile(new URL('./fixtures/claude-session.jsonl', import.meta.url), 'utf8'), {

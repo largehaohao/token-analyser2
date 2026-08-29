@@ -242,6 +242,116 @@ test('keeps Codex desktop model snapshots distinct with stable file session owne
   assert.equal(analysis?.usage.totalTokens, 27);
 });
 
+test('incremental collection retains Codex Fast service tier for later usage', async () => {
+  const initial = [
+    JSON.stringify({ type: 'session_meta', payload: { id: 'fast-live' } }),
+    JSON.stringify({ type: 'event_msg', payload: { type: 'thread_settings_applied', thread_settings: { service_tier: 'priority' } } }),
+    JSON.stringify({ type: 'turn_context', payload: { model: 'gpt-5.6-sol' } }),
+  ].join('\n') + '\n';
+  const log = '/logs/codex.jsonl';
+  const fs = memoryFs({ [log]: initial });
+  const collector = createCollector(fs);
+
+  await collector.start('/logs');
+  fs.write(log, initial + JSON.stringify({
+    timestamp: '2026-08-29T10:00:00Z',
+    type: 'event_msg',
+    payload: {
+      type: 'token_count',
+      info: {
+        last_token_usage: { input_tokens: 100, output_tokens: 10 },
+        total_token_usage: { input_tokens: 100, output_tokens: 10 },
+      },
+    },
+  }) + '\n');
+  await collector.poll();
+
+  const analysis = collector.snapshot().analysis!;
+  assert.equal(analysis.calls[0]?.serviceTier, 'fast');
+  assert.equal(analysis.cost.credits, undefined);
+  assert.equal(analysis.cost.unknownCalls, 1);
+});
+
+test('incremental collection retains request ownership and skips an unchanged token total', async () => {
+  const initial = [
+    JSON.stringify({ type: 'session_meta', payload: { id: 'continued-live' } }),
+    JSON.stringify({ type: 'user', call_id: 'request-1', session_id: 'continued-live', text: 'continue' }),
+    JSON.stringify({ type: 'turn_context', payload: { model: 'gpt-5.6-sol' } }),
+  ].join('\n') + '\n';
+  const usage = (timestamp: string) => JSON.stringify({
+    timestamp,
+    type: 'event_msg',
+    payload: {
+      type: 'token_count',
+      info: {
+        last_token_usage: { input_tokens: 50, output_tokens: 5 },
+        total_token_usage: { input_tokens: 50, output_tokens: 5 },
+      },
+    },
+  }) + '\n';
+  const log = '/logs/session.jsonl';
+  const fs = memoryFs({ [log]: initial });
+  const collector = createCollector(fs);
+
+  await collector.start('/logs');
+  fs.write(log, initial + usage('2026-08-29T10:00:00Z'));
+  await collector.poll();
+  fs.write(log, initial + usage('2026-08-29T10:00:00Z') + usage('2026-08-29T10:01:00Z'));
+  await collector.poll();
+
+  const analysis = collector.snapshot().analysis!;
+  const raw = collector.rawSnapshot();
+  assert.equal(analysis.calls.length, 1);
+  assert.equal(analysis.calls[0]?.userRequestId, 'request-1');
+  assert.equal(analysis.usage.totalTokens, 55);
+  assert.equal(raw.events.find((event) => event.kind === 'user')?.provider, 'codex');
+});
+
+test('incremental collection removes a Codex child replay when its boundary arrives later', async () => {
+  const initial = [
+    JSON.stringify({ type: 'session_meta', payload: { id: 'child-live', parent_session_id: 'parent-live' } }),
+    JSON.stringify({
+      timestamp: '2026-08-29T10:00:00Z',
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: {
+          last_token_usage: { input_tokens: 100, output_tokens: 10 },
+          total_token_usage: { input_tokens: 100, output_tokens: 10 },
+        },
+      },
+    }),
+  ].join('\n') + '\n';
+  const appended = [
+    JSON.stringify({ timestamp: '2026-08-29T10:01:00Z', type: 'event_msg', payload: { type: 'task_started' } }),
+    JSON.stringify({
+      timestamp: '2026-08-29T10:02:00Z',
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: {
+          last_token_usage: { input_tokens: 20, output_tokens: 2 },
+          total_token_usage: { input_tokens: 120, output_tokens: 12 },
+        },
+      },
+    }),
+  ].join('\n') + '\n';
+  const log = '/logs/codex.jsonl';
+  const fs = memoryFs({ [log]: initial });
+  const collector = createCollector(fs);
+
+  await collector.start('/logs');
+  assert.equal(collector.snapshot().analysis?.calls.length, 1);
+  fs.write(log, initial + appended);
+  await collector.poll();
+
+  const raw = collector.rawSnapshot();
+  const analysis = collector.snapshot().analysis!;
+  assert.equal(raw.events.filter((event) => event.replayed).length, 1);
+  assert.equal(analysis.calls.length, 1);
+  assert.equal(analysis.usage.totalTokens, 22);
+});
+
 test('scans Codex root sessions without ingesting unrelated JSON files', async () => {
   const usage = (sessionId: string, input: number) => JSON.stringify({
     type: 'assistant',

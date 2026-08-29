@@ -1,10 +1,13 @@
 import {
   buildAnalysis,
+  cloneParseContinuationState,
+  createParseContinuationState,
   parseJsonl,
   defaultRateSnapshots,
   type AnalysisEvent,
   type AnalysisResult,
   type ParseError,
+  type ParseContinuationState,
   type Provider,
   type RateSnapshot,
 } from './analysis';
@@ -45,11 +48,13 @@ interface FileCursor {
   pendingStart?: number;
   lineNumber: number;
   sessionId?: string;
+  provider?: Provider;
   model?: string;
   cwd?: string;
   sessionTitle?: string;
   pendingOutputs: Map<string, string>;
   toolEvents: Map<string, AnalysisEvent>;
+  continuation: ParseContinuationState;
 }
 
 function joinPath(dir: string, name: string): string {
@@ -165,8 +170,10 @@ export function createCollector(fs: CollectorFs, rates: RateSnapshot[] = default
       pendingStart: undefined,
       lineNumber: 0,
       sessionId: sessionIdFromPath(fullPath),
+      provider: providerFromName(relative) === 'unknown' ? undefined : providerFromName(relative),
       pendingOutputs: new Map(),
       toolEvents: new Map(),
+      continuation: createParseContinuationState(),
     };
     let changed = false;
     const info = await fs.stat(fullPath);
@@ -176,11 +183,13 @@ export function createCollector(fs: CollectorFs, rates: RateSnapshot[] = default
       cursor.pendingStart = undefined;
       cursor.lineNumber = 0;
       cursor.sessionId = sessionIdFromPath(fullPath);
+      cursor.provider = providerFromName(relative) === 'unknown' ? undefined : providerFromName(relative);
       cursor.model = undefined;
       cursor.cwd = undefined;
       cursor.sessionTitle = undefined;
       cursor.pendingOutputs = new Map();
       cursor.toolEvents = new Map();
+      cursor.continuation = createParseContinuationState();
       eventsByFile.delete(relative);
       errorsByFile.delete(relative);
       changed = true;
@@ -200,9 +209,10 @@ export function createCollector(fs: CollectorFs, rates: RateSnapshot[] = default
     cursor.sessionId ??= sessionIdFromFirstRecord(completeText);
     let pendingOutputs = new Map(cursor.pendingOutputs);
     let toolEvents = new Map(cursor.toolEvents);
+    let continuation = cloneParseContinuationState(cursor.continuation);
     const parseChunk = (text: string) => parseJsonl(text, {
       sourceFile: relative,
-      provider: providerFromName(relative) === 'unknown' ? undefined : providerFromName(relative),
+      provider: cursor.provider,
       sessionId: cursor.sessionId,
       model: cursor.model,
       cwd: cursor.cwd,
@@ -210,6 +220,7 @@ export function createCollector(fs: CollectorFs, rates: RateSnapshot[] = default
       lineOffset: cursor.lineNumber,
       pendingOutputs,
       toolEvents,
+      continuation,
     });
     let parsed = completeText ? parseChunk(completeText) : undefined;
     // A writer can flush a newline before finishing the JSON object. Defer a
@@ -222,11 +233,22 @@ export function createCollector(fs: CollectorFs, rates: RateSnapshot[] = default
       completeText = lines.length ? lines.join('\n') + '\n' : '';
       pendingOutputs = new Map(cursor.pendingOutputs);
       toolEvents = new Map(cursor.toolEvents);
+      continuation = cloneParseContinuationState(cursor.continuation);
       parsed = completeText ? parseChunk(completeText) : undefined;
     }
     if (parsed) {
       cursor.pendingOutputs = pendingOutputs;
       cursor.toolEvents = toolEvents;
+      cursor.continuation = continuation;
+      if (parsed.provider !== 'unknown') {
+        cursor.provider = parsed.provider;
+        for (const event of kept) {
+          if (event.provider === 'unknown') {
+            event.provider = parsed.provider;
+            changed = true;
+          }
+        }
+      }
       cursor.model ??= parsed.events.find((event) => event.model)?.model;
       cursor.cwd = parsed.events.findLast((event) => event.cwd)?.cwd ?? cursor.cwd;
       cursor.sessionTitle = parsed.events.findLast((event) => event.sessionTitle)?.sessionTitle ?? cursor.sessionTitle;
