@@ -48,6 +48,8 @@ interface FileCursor {
   model?: string;
   cwd?: string;
   sessionTitle?: string;
+  pendingOutputs: Map<string, string>;
+  toolEvents: Map<string, AnalysisEvent>;
 }
 
 function joinPath(dir: string, name: string): string {
@@ -157,12 +159,14 @@ export function createCollector(fs: CollectorFs, rates: RateSnapshot[] = default
   async function ingestFile(fullPath: string): Promise<void> {
     if (!root) return;
     const relative = relativeTo(root, fullPath);
-    const cursor = cursors.get(fullPath) ?? {
+    const cursor: FileCursor = cursors.get(fullPath) ?? {
       parsedBytes: 0,
       pending: '',
       pendingStart: undefined,
       lineNumber: 0,
       sessionId: sessionIdFromPath(fullPath),
+      pendingOutputs: new Map(),
+      toolEvents: new Map(),
     };
     let changed = false;
     const info = await fs.stat(fullPath);
@@ -175,6 +179,8 @@ export function createCollector(fs: CollectorFs, rates: RateSnapshot[] = default
       cursor.model = undefined;
       cursor.cwd = undefined;
       cursor.sessionTitle = undefined;
+      cursor.pendingOutputs = new Map();
+      cursor.toolEvents = new Map();
       eventsByFile.delete(relative);
       errorsByFile.delete(relative);
       changed = true;
@@ -192,7 +198,9 @@ export function createCollector(fs: CollectorFs, rates: RateSnapshot[] = default
     const fileErrors: ParseError[] = errorsByFile.get(relative) ?? [];
     let completeText = lines.length ? lines.join('\n') + '\n' : '';
     cursor.sessionId ??= sessionIdFromFirstRecord(completeText);
-    let parsed = completeText ? parseJsonl(completeText, {
+    let pendingOutputs = new Map(cursor.pendingOutputs);
+    let toolEvents = new Map(cursor.toolEvents);
+    const parseChunk = (text: string) => parseJsonl(text, {
       sourceFile: relative,
       provider: providerFromName(relative) === 'unknown' ? undefined : providerFromName(relative),
       sessionId: cursor.sessionId,
@@ -200,7 +208,10 @@ export function createCollector(fs: CollectorFs, rates: RateSnapshot[] = default
       cwd: cursor.cwd,
       sessionTitle: cursor.sessionTitle,
       lineOffset: cursor.lineNumber,
-    }) : undefined;
+      pendingOutputs,
+      toolEvents,
+    });
+    let parsed = completeText ? parseChunk(completeText) : undefined;
     // A writer can flush a newline before finishing the JSON object. Defer a
     // malformed final record and retry it with the next appended chunk rather
     // than turning a transient tail into a permanent parse error.
@@ -209,23 +220,19 @@ export function createCollector(fs: CollectorFs, rates: RateSnapshot[] = default
       pending = lines.at(-1) ?? pending;
       lines = lines.slice(0, -1);
       completeText = lines.length ? lines.join('\n') + '\n' : '';
-      parsed = completeText ? parseJsonl(completeText, {
-        sourceFile: relative,
-        provider: providerFromName(relative) === 'unknown' ? undefined : providerFromName(relative),
-        sessionId: cursor.sessionId,
-        model: cursor.model,
-        cwd: cursor.cwd,
-        sessionTitle: cursor.sessionTitle,
-        lineOffset: cursor.lineNumber,
-      }) : undefined;
+      pendingOutputs = new Map(cursor.pendingOutputs);
+      toolEvents = new Map(cursor.toolEvents);
+      parsed = completeText ? parseChunk(completeText) : undefined;
     }
     if (parsed) {
+      cursor.pendingOutputs = pendingOutputs;
+      cursor.toolEvents = toolEvents;
       cursor.model ??= parsed.events.find((event) => event.model)?.model;
       cursor.cwd = parsed.events.findLast((event) => event.cwd)?.cwd ?? cursor.cwd;
       cursor.sessionTitle = parsed.events.findLast((event) => event.sessionTitle)?.sessionTitle ?? cursor.sessionTitle;
       kept.push(...parsed.events);
       fileErrors.push(...parsed.errors);
-      changed = changed || parsed.events.length > 0 || parsed.errors.length > 0;
+      changed = changed || parsed.events.length > 0 || parsed.errors.length > 0 || Boolean(parsed.updatedExisting);
     }
     const chunkBytes = Buffer.byteLength(chunk, 'utf8');
     cursor.parsedBytes = readOffset + chunkBytes;

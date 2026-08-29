@@ -76,12 +76,18 @@ export async function readFileDocuments(
 
 export async function readHandleDocuments(
   handles: Array<{ handle: FileHandleLike; relativePath?: string; provider?: Provider }>,
+  previous?: SourceDocument[],
 ): Promise<SourceDocument[]> {
+  const prior = new Map((previous ?? []).map((document) => [document.relativePath ?? document.name, document]));
   return Promise.all(
     handles.map(async ({ handle, relativePath, provider }, index) => {
       const label = relativePath ?? handle.name ?? '未知文件';
       try {
         const file = await handle.getFile();
+        const cached = prior.get(relativePath ?? file.name);
+        if (cached && cached.lastModified === file.lastModified && cached.error === undefined) {
+          return cached;
+        }
         return {
           id: sourceId(relativePath ?? file.name, index, file.lastModified),
           name: file.name,
@@ -151,6 +157,7 @@ export function startDirectoryWatcher(
 ): () => void {
   let stopped = false;
   let inFlight = false;
+  let previous: SourceDocument[] = [];
   const poll = async () => {
     if (stopped || inFlight) return;
     inFlight = true;
@@ -159,7 +166,9 @@ export function startDirectoryWatcher(
         ...item,
         provider: providerFromName(item.relativePath),
       }));
-      await onUpdate(await readHandleDocuments(handles));
+      const documents = await readHandleDocuments(handles, previous);
+      previous = documents;
+      await onUpdate(documents);
     } catch (error) {
       onError?.(error);
     } finally {
@@ -181,11 +190,14 @@ export function startHandleWatcher(
 ): () => void {
   let stopped = false;
   let inFlight = false;
+  let previous: SourceDocument[] = [];
   const poll = async () => {
     if (stopped || inFlight) return;
     inFlight = true;
     try {
-      await onUpdate(await readHandleDocuments(handles));
+      const documents = await readHandleDocuments(handles, previous);
+      previous = documents;
+      await onUpdate(documents);
     } catch (error) {
       onError?.(error);
     } finally {

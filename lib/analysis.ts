@@ -78,6 +78,7 @@ export interface ParsedJsonl {
   provider: Provider;
   sourceFile: string;
   lineCount: number;
+  updatedExisting?: boolean;
 }
 
 export interface ParseError {
@@ -207,6 +208,8 @@ interface ParseOptions {
   cwd?: string;
   sessionTitle?: string;
   lineOffset?: number;
+  pendingOutputs?: Map<string, string>;
+  toolEvents?: Map<string, AnalysisEvent>;
 }
 
 type JsonRecord = Record<string, unknown>;
@@ -826,8 +829,10 @@ export function parseJsonl(text: string, options: ParseOptions): ParsedJsonl {
   let latestSession = fallbackSession;
   let latestUserRequest: string | undefined;
   const seenUsageSessions = new Set<string>();
-  const toolEvents = new Map<string, AnalysisEvent>();
-  const pendingOutputs = new Map<string, string>();
+  const toolEvents = options.toolEvents ?? new Map<string, AnalysisEvent>();
+  const pendingOutputs = options.pendingOutputs ?? new Map<string, string>();
+  const priorToolIds = new Set(toolEvents.keys());
+  let updatedExisting = false;
   const sessionTitles = new Map<string, string>();
   const sessionDirectories = new Map<string, string>();
   if (options.sessionId && options.cwd) sessionDirectories.set(options.sessionId, options.cwd);
@@ -988,6 +993,7 @@ export function parseJsonl(text: string, options: ParseOptions): ParsedJsonl {
         existing.stateHash = hashText(output.replace(/\s+/g, ' ').trim());
         existing.complete = !record.partial && !payload.partial;
         if (existing.kind === 'wait') existing.pureWait = !nested;
+        if (priorToolIds.has(outputCallId)) updatedExisting = true;
       }
     }
 
@@ -1147,6 +1153,7 @@ export function parseJsonl(text: string, options: ParseOptions): ParsedJsonl {
       event.stateHash = hashText(output.replace(/\s+/g, ' ').trim());
       event.complete = true;
       if (event.kind === 'wait') event.pureWait = !nested;
+      if (priorToolIds.has(event.callId)) updatedExisting = true;
     }
   }
   events.sort(compareEvents);
@@ -1156,6 +1163,7 @@ export function parseJsonl(text: string, options: ParseOptions): ParsedJsonl {
     provider,
     sourceFile,
     lineCount: lines.length,
+    updatedExisting,
   };
 }
 
@@ -1315,13 +1323,29 @@ function eventFingerprint(event: AnalysisEvent): string {
   ].join('|');
 }
 
+function eventKey(event: Pick<AnalysisEvent, 'provider' | 'id'>): string {
+  return event.provider + '\0' + event.id;
+}
+
+function laterTimestamp(current: string | undefined, candidate: string | undefined): string | undefined {
+  if (!candidate) return current;
+  if (!current) return candidate;
+  const currentMs = Date.parse(current);
+  const candidateMs = Date.parse(candidate);
+  if (Number.isFinite(currentMs) && Number.isFinite(candidateMs) && currentMs !== candidateMs) {
+    return candidateMs > currentMs ? candidate : current;
+  }
+  return candidate > current ? candidate : current;
+}
+
 function dedupeAndDelta(events: AnalysisEvent[]): AnalysisEvent[] {
   const seenIds = new Set<string>();
   const seenFingerprints = new Map<string, AnalysisEvent>();
   const seenSnapshots = new Map<string, Usage>();
   const result: AnalysisEvent[] = [];
   for (const original of [...events].sort(compareEvents)) {
-    if (seenIds.has(original.id)) continue;
+    const identity = eventKey(original);
+    if (seenIds.has(identity)) continue;
     const event = { ...original, usage: original.usage ? { ...original.usage } : undefined };
     const fingerprint = eventFingerprint(event);
     const duplicate = seenFingerprints.get(fingerprint);
@@ -1334,10 +1358,10 @@ function dedupeAndDelta(events: AnalysisEvent[]): AnalysisEvent[] {
         if (!duplicate.contentHash && event.contentHash) duplicate.contentHash = event.contentHash;
         if (!duplicate.stateHash && event.stateHash) duplicate.stateHash = event.stateHash;
       }
-      seenIds.add(original.id);
+      seenIds.add(identity);
       continue;
     }
-    seenIds.add(original.id);
+    seenIds.add(identity);
     seenFingerprints.set(fingerprint, event);
     if (event.kind === 'model' && event.scope === 'tree' && event.usage?.cumulative) {
       const key = [
@@ -1447,7 +1471,11 @@ function matchRate(call: AnalysisEvent, rates: RateSnapshot[]): RateSnapshot | u
       return { rate, score };
     })
     .filter((item) => item.score > 0)
-    .sort((left, right) => right.score - left.score);
+    .sort((left, right) => {
+      if (left.rate.kind === 'custom' && right.rate.kind !== 'custom') return -1;
+      if (left.rate.kind !== 'custom' && right.rate.kind === 'custom') return 1;
+      return right.score - left.score;
+    });
   const matches = scored.map((item) => item.rate);
   if (!matches.length) return undefined;
   // A custom snapshot may only define USD or credits. Fill its missing unit
@@ -2125,9 +2153,7 @@ function createSessions(calls: AnalysisEvent[], rates: RateSnapshot[]): Analysis
       current.ownCalls.push(call);
       if (call.sessionTitle) current.title = call.sessionTitle;
       if (call.cwd) current.cwd = call.cwd;
-      if (call.timestamp && (!current.lastDataAt || call.timestamp > current.lastDataAt)) {
-        current.lastDataAt = call.timestamp;
-      }
+      if (call.timestamp) current.lastDataAt = laterTimestamp(current.lastDataAt, call.timestamp);
       continue;
     }
     map.set(key, {
@@ -2179,7 +2205,7 @@ function candidateCost(
   rates: RateSnapshot[],
   necessaryCallIds: Set<string>,
 ): CostSummary {
-  const byId = new Map(calls.map((call) => [call.id, call]));
+  const byId = new Map(calls.map((call) => [eventKey(call), call]));
   const ids = new Set<string>();
   for (const anomaly of anomalies) {
     // Only a complete, high-confidence pattern with separable behavior can
@@ -2187,7 +2213,8 @@ function candidateCost(
     // visible for review but must not look like a confirmed amount.
     if (anomaly.mixed || anomaly.confidence !== 'high') continue;
     for (const id of anomaly.candidateCallIds) {
-      if (!necessaryCallIds.has(id)) ids.add(id);
+      const key = eventKey({ provider: anomaly.provider, id });
+      if (!necessaryCallIds.has(id) && !necessaryCallIds.has(key)) ids.add(key);
     }
   }
   const selected = [...ids].map((id) => byId.get(id)).filter((item): item is AnalysisEvent => Boolean(item));
@@ -2202,7 +2229,8 @@ function hasUnknownData(events: AnalysisEvent[], errors: ParseError[]): boolean 
         event.kind === 'unknown' ||
         (event.kind === 'model' && !event.usage && event.reportedCostUsd === undefined) ||
         usageHasInconsistentCached(event.usage) ||
-        (event.kind === 'tool' && event.complete === false),
+        (event.kind === 'tool' && event.complete === false) ||
+        (event.kind === 'wait' && event.complete === false),
     )
   );
 }
@@ -2243,11 +2271,10 @@ export function buildAnalysis(
     cost,
     candidateCost: calculateCost([], rates),
     necessaryCallIds,
-    lastDataAt: events
-      .map((event) => event.timestamp)
-      .filter(Boolean)
-      .sort()
-      .at(-1),
+    lastDataAt: events.reduce<string | undefined>(
+      (latest, event) => laterTimestamp(latest, event.timestamp),
+      undefined,
+    ),
     errors: options.errors ?? [],
     rates,
     completeness: hasUnknownData(events, options.errors ?? []) ? 'partial' : 'complete',
@@ -2279,20 +2306,22 @@ export function scopeAnalysis(
     return Number.isFinite(time) && time >= (options.since ?? -Infinity) && time <= (options.until ?? Infinity);
   };
   const calls = analysis.calls.filter(matches);
-  const byId = new Map(calls.map((call) => [call.id, call]));
-  const anomalies = analysis.anomalies.filter((item) => item.callIds.some((id) => byId.has(id))).map((item) => {
-    const callIds = item.callIds.filter((id) => byId.has(id));
-    const candidateCallIds = item.candidateCallIds.filter((id) => byId.has(id));
+  const byId = new Map(calls.map((call) => [eventKey(call), call]));
+  const anomalies = analysis.anomalies.filter((item) => item.callIds.some((id) => byId.has(eventKey({ provider: item.provider, id })))).map((item) => {
+    const callIds = item.callIds.filter((id) => byId.has(eventKey({ provider: item.provider, id })));
+    const candidateCallIds = item.candidateCallIds.filter((id) => byId.has(eventKey({ provider: item.provider, id })));
     return {
       ...item,
       callIds,
       candidateCallIds,
-      baselineCallIds: item.baselineCallIds.filter((id) => byId.has(id)),
+      baselineCallIds: item.baselineCallIds.filter((id) => byId.has(eventKey({ provider: item.provider, id }))),
       necessary: candidateCallIds.length > 0 && candidateCallIds.every((id) => analysis.necessaryCallIds.has(id)),
-      associatedCost: calculateCost(callIds.map((id) => byId.get(id)!), analysis.rates),
+      associatedCost: calculateCost(callIds.map((id) => byId.get(eventKey({ provider: item.provider, id }))!), analysis.rates),
     };
   });
   const events = analysis.events.filter(matches);
+  const activeFiles = new Set(events.map((event) => event.sourceFile));
+  const errors = analysis.errors.filter((error) => error.sourceFile && activeFiles.has(error.sourceFile));
   // A session-wide reported bill cannot be allocated to a smaller time window.
   const reportedSummaries = hasWindow ? [] : events.filter((event) => event.kind === 'model' && event.scope === 'summary');
   const cost = calculateCost(calls, analysis.rates, reportedSummaries);
@@ -2306,8 +2335,9 @@ export function scopeAnalysis(
     cost,
     candidateCost: candidateCost(anomalies, calls, analysis.rates, analysis.necessaryCallIds),
     lastDataAt: calls.filter((call) => Number.isFinite(Date.parse(call.timestamp)))
-      .reduce<string | undefined>((latest, call) => !latest || Date.parse(call.timestamp) > Date.parse(latest) ? call.timestamp : latest, undefined),
-    completeness: hasUnknownData(events, analysis.errors) ? 'partial' : 'complete',
+      .reduce<string | undefined>((latest, call) => laterTimestamp(latest, call.timestamp), undefined),
+    completeness: hasUnknownData(events, errors) ? 'partial' : 'complete',
+    errors,
   };
 }
 
@@ -2398,7 +2428,7 @@ export function createDemoAnalysis(): AnalysisResult {
       demoCall('demo-call-' + String(index++), 'codex', child, '认证模块子 Agent', 'gpt-5.6-sol', at(minutes), 'subagent', 180_000, 22_000, auth),
     );
   }
-  for (const minutes of [3300, 2700, 2100, 1300, 520]) {
+  for (const minutes of [3300, 2700, 2100, 520, 518, 516, 514, 512]) {
     events.push(
       demoCall('demo-call-' + String(index++), 'claude', api, 'Review API 接口变更', 'claude-sonnet-4', at(minutes), minutes < 800 ? 'read' : 'code', 150_000, 24_000),
     );
