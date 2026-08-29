@@ -26,6 +26,8 @@ export interface Usage {
   inputTokens: number;
   cachedInputTokens?: number;
   cacheCreationInputTokens?: number;
+  cacheCreationInputTokens5m?: number;
+  cacheCreationInputTokens1h?: number;
   outputTokens: number;
   reasoningTokens?: number;
   inputIncludesCached?: boolean;
@@ -67,6 +69,9 @@ export interface AnalysisEvent {
   reportedCostUsd?: number;
   scope?: 'call' | 'tree' | 'summary';
   complete?: boolean;
+  /** Codex subagent history copied from its parent; never bill it again. */
+  replayed?: boolean;
+  serviceTier?: 'standard' | 'fast' | 'unknown';
   text?: string;
   rawType?: string;
   contextSnapshot?: ContextSnapshot;
@@ -94,13 +99,18 @@ export interface RateSnapshot {
   inputCreditsPerMillion?: number;
   cachedInputCreditsPerMillion?: number;
   cacheCreationCreditsPerMillion?: number;
+  cacheCreation1hCreditsPerMillion?: number;
   outputCreditsPerMillion?: number;
   inputUsdPerMillion?: number;
   cachedInputUsdPerMillion?: number;
   cacheCreationUsdPerMillion?: number;
+  cacheCreation1hUsdPerMillion?: number;
   outputUsdPerMillion?: number;
   source: string;
   checkedDate: string;
+  effectiveFrom?: string;
+  effectiveTo?: string;
+  serviceTier?: 'standard' | 'fast';
   applicability: string;
   kind: 'official' | 'custom' | 'demo';
 }
@@ -228,6 +238,7 @@ export const defaultRateSnapshots: RateSnapshot[] = [
     source: 'OpenAI Help Center Codex rate card · https://help.openai.com/en/articles/11481834',
     checkedDate: '2026-08-28',
     applicability: 'ChatGPT Work / Codex token-based credit pricing; plan, fast mode and long-context conditions must match',
+    serviceTier: 'standard',
     kind: 'official',
   },
   {
@@ -241,6 +252,7 @@ export const defaultRateSnapshots: RateSnapshot[] = [
     source: 'OpenAI Help Center Codex rate card · https://help.openai.com/en/articles/11481834',
     checkedDate: '2026-08-28',
     applicability: 'ChatGPT Work / Codex token-based credit pricing; plan, fast mode and long-context conditions must match',
+    serviceTier: 'standard',
     kind: 'official',
   },
   {
@@ -254,6 +266,7 @@ export const defaultRateSnapshots: RateSnapshot[] = [
     source: 'OpenAI Help Center Codex rate card · https://help.openai.com/en/articles/11481834',
     checkedDate: '2026-08-28',
     applicability: 'ChatGPT Work / Codex token-based credit pricing; plan, fast mode and long-context conditions must match',
+    serviceTier: 'standard',
     kind: 'official',
   },
   {
@@ -267,6 +280,7 @@ export const defaultRateSnapshots: RateSnapshot[] = [
     source: 'OpenAI Help Center Codex rate card · https://help.openai.com/en/articles/11481834',
     checkedDate: '2026-08-28',
     applicability: 'ChatGPT Work / Codex token-based credit pricing; plan, fast mode and long-context conditions must match',
+    serviceTier: 'standard',
     kind: 'official',
   },
   {
@@ -280,6 +294,7 @@ export const defaultRateSnapshots: RateSnapshot[] = [
     source: 'OpenAI Help Center Codex rate card · https://help.openai.com/en/articles/11481834',
     checkedDate: '2026-08-28',
     applicability: 'ChatGPT Work / Codex token-based credit pricing; plan, fast mode and long-context conditions must match',
+    serviceTier: 'standard',
     kind: 'official',
   },
   {
@@ -293,6 +308,7 @@ export const defaultRateSnapshots: RateSnapshot[] = [
     source: 'OpenAI Help Center Codex rate card · https://help.openai.com/en/articles/11481834',
     checkedDate: '2026-08-28',
     applicability: 'ChatGPT Work / Codex token-based credit pricing; plan, fast mode and long-context conditions must match',
+    serviceTier: 'standard',
     kind: 'official',
   },
   {
@@ -306,6 +322,37 @@ export const defaultRateSnapshots: RateSnapshot[] = [
     source: 'OpenAI Help Center Codex rate card · https://help.openai.com/en/articles/11481834',
     checkedDate: '2026-08-28',
     applicability: 'ChatGPT Work / Codex token-based credit pricing; plan, fast mode and long-context conditions must match',
+    serviceTier: 'standard',
+    kind: 'official',
+  },
+  {
+    id: 'claude-sonnet-5-2026-08',
+    provider: 'claude',
+    modelPattern: 'claude-sonnet-5',
+    inputUsdPerMillion: 2,
+    cachedInputUsdPerMillion: 0.2,
+    cacheCreationUsdPerMillion: 2.5,
+    cacheCreation1hUsdPerMillion: 4,
+    outputUsdPerMillion: 10,
+    source: 'Anthropic API pricing · https://docs.anthropic.com/en/about-claude/pricing',
+    checkedDate: '2026-08-29',
+    effectiveFrom: '2026-06-30',
+    applicability: 'Anthropic API list prices; Claude Code subscription or included usage may differ',
+    kind: 'official',
+  },
+  {
+    id: 'claude-opus-5-2026-08',
+    provider: 'claude',
+    modelPattern: 'claude-opus-5',
+    inputUsdPerMillion: 5,
+    cachedInputUsdPerMillion: 0.5,
+    cacheCreationUsdPerMillion: 6.25,
+    cacheCreation1hUsdPerMillion: 10,
+    outputUsdPerMillion: 25,
+    source: 'Anthropic API pricing · https://docs.anthropic.com/en/about-claude/pricing',
+    checkedDate: '2026-08-29',
+    effectiveFrom: '2026-07-24',
+    applicability: 'Anthropic API list prices; Claude Code subscription or included usage may differ',
     kind: 'official',
   },
   {
@@ -315,6 +362,7 @@ export const defaultRateSnapshots: RateSnapshot[] = [
     inputUsdPerMillion: 3,
     cachedInputUsdPerMillion: 0.3,
     cacheCreationUsdPerMillion: 3.75,
+    cacheCreation1hUsdPerMillion: 6,
     outputUsdPerMillion: 15,
     source: 'Anthropic API pricing · https://docs.anthropic.com/en/about-claude/pricing',
     checkedDate: '2026-08-28',
@@ -322,16 +370,45 @@ export const defaultRateSnapshots: RateSnapshot[] = [
     kind: 'official',
   },
   {
-    id: 'claude-opus-4-2026-08',
+    id: 'claude-opus-4-current-2026-08',
+    provider: 'claude',
+    modelPattern: 'claude-opus-4-8*',
+    inputUsdPerMillion: 5,
+    cachedInputUsdPerMillion: 0.5,
+    cacheCreationUsdPerMillion: 6.25,
+    cacheCreation1hUsdPerMillion: 10,
+    outputUsdPerMillion: 25,
+    source: 'Anthropic API pricing · https://docs.anthropic.com/en/about-claude/pricing',
+    checkedDate: '2026-08-28',
+    applicability: 'Anthropic API list prices; Claude Code subscription or included usage may differ',
+    kind: 'official',
+  },
+  ...['7', '6', '5'].map((minor): RateSnapshot => ({
+    id: 'claude-opus-4-' + minor + '-2026-08',
+    provider: 'claude',
+    modelPattern: 'claude-opus-4-' + minor + '*',
+    inputUsdPerMillion: 5,
+    cachedInputUsdPerMillion: 0.5,
+    cacheCreationUsdPerMillion: 6.25,
+    cacheCreation1hUsdPerMillion: 10,
+    outputUsdPerMillion: 25,
+    source: 'Anthropic API pricing · https://docs.anthropic.com/en/about-claude/pricing',
+    checkedDate: '2026-08-29',
+    applicability: 'Anthropic API list prices; Claude Code subscription or included usage may differ',
+    kind: 'official',
+  })),
+  {
+    id: 'claude-opus-4-legacy-2026-08',
     provider: 'claude',
     modelPattern: 'claude-opus-4',
     inputUsdPerMillion: 15,
     cachedInputUsdPerMillion: 1.5,
     cacheCreationUsdPerMillion: 18.75,
+    cacheCreation1hUsdPerMillion: 30,
     outputUsdPerMillion: 75,
     source: 'Anthropic API pricing · https://docs.anthropic.com/en/about-claude/pricing',
-    checkedDate: '2026-08-28',
-    applicability: 'Anthropic API list prices; Claude Code subscription or included usage may differ',
+    checkedDate: '2026-08-29',
+    applicability: 'Legacy Claude Opus 4 / 4.1 API list prices; later 4.x versions have specific lower-priced snapshots',
     kind: 'official',
   },
   {
@@ -341,6 +418,7 @@ export const defaultRateSnapshots: RateSnapshot[] = [
     inputUsdPerMillion: 1,
     cachedInputUsdPerMillion: 0.1,
     cacheCreationUsdPerMillion: 1.25,
+    cacheCreation1hUsdPerMillion: 2,
     outputUsdPerMillion: 5,
     source: 'Anthropic API pricing · https://docs.anthropic.com/en/about-claude/pricing',
     checkedDate: '2026-08-28',
@@ -497,6 +575,15 @@ function boundedText(value: string | undefined, limit = 4000): string | undefine
 
 function usageFromRecord(value: unknown): Usage | undefined {
   if (!isRecord(value)) return undefined;
+  const cacheCreationBreakdown = firstRecord(value.cache_creation, value.cacheCreation);
+  const cacheCreation5m = numberValue(
+    cacheCreationBreakdown?.ephemeral_5m_input_tokens,
+    cacheCreationBreakdown?.ephemeral5mInputTokens,
+  );
+  const cacheCreation1h = numberValue(
+    cacheCreationBreakdown?.ephemeral_1h_input_tokens,
+    cacheCreationBreakdown?.ephemeral1hInputTokens,
+  );
   const input = numberValue(
     value.input_tokens,
     value.inputTokens,
@@ -510,10 +597,15 @@ function usageFromRecord(value: unknown): Usage | undefined {
     value.cacheReadInputTokens,
     value.cache_read_tokens,
   );
-  const cacheCreation = numberValue(
+  const reportedCacheCreation = numberValue(
     value.cache_creation_input_tokens,
     value.cacheCreationInputTokens,
     value.cache_creation_tokens,
+  );
+  const cacheCreation = reportedCacheCreation ?? (
+    cacheCreation5m !== undefined || cacheCreation1h !== undefined
+      ? (cacheCreation5m ?? 0) + (cacheCreation1h ?? 0)
+      : undefined
   );
   const output = numberValue(
     value.output_tokens,
@@ -534,6 +626,8 @@ function usageFromRecord(value: unknown): Usage | undefined {
     inputTokens: input ?? 0,
     cachedInputTokens: cached ?? 0,
     cacheCreationInputTokens: cacheCreation ?? 0,
+    cacheCreationInputTokens5m: cacheCreation5m,
+    cacheCreationInputTokens1h: cacheCreation1h,
     outputTokens: output ?? 0,
     reasoningTokens: reasoning ?? 0,
   };
@@ -778,20 +872,31 @@ function findText(record: JsonRecord): string | undefined {
   );
 }
 
-function tokenSnapshotUsage(record: JsonRecord): { usage?: Usage; cumulative: boolean } {
+function tokenSnapshotUsage(record: JsonRecord): { usage?: Usage; cumulative: boolean; total?: Usage } {
   const payload = payloadOf(record);
   const info = nestedRecord(payload, 'info') ?? nestedRecord(record, 'info');
   const total = info ? usageFromRecord(info.total_token_usage ?? info.totalTokenUsage) : undefined;
-  if (total) {
-    total.outputIncludesReasoning = true;
-    return { usage: total, cumulative: true };
-  }
   const last = info ? usageFromRecord(info.last_token_usage ?? info.lastTokenUsage) : undefined;
   if (last) {
     last.outputIncludesReasoning = true;
-    return { usage: last, cumulative: false };
+    if (total) total.outputIncludesReasoning = true;
+    return { usage: last, cumulative: false, total };
+  }
+  if (total) {
+    total.outputIncludesReasoning = true;
+    return { usage: total, cumulative: true, total };
   }
   return { usage: findUsage(record), cumulative: true };
+}
+
+function serviceTierFromRecord(record: JsonRecord): 'standard' | 'fast' | 'unknown' | undefined {
+  const payload = payloadOf(record);
+  const settings = firstRecord(payload.thread_settings, payload.threadSettings, record.thread_settings, record.threadSettings);
+  const raw = stringValue(settings?.service_tier, settings?.serviceTier)?.toLowerCase();
+  if (!raw) return undefined;
+  if (raw === 'priority' || raw === 'fast') return 'fast';
+  if (raw === 'default' || raw === 'standard') return 'standard';
+  return 'unknown';
 }
 
 function makeEvent(
@@ -839,6 +944,10 @@ export function parseJsonl(text: string, options: ParseOptions): ParsedJsonl {
   if (options.sessionId && options.sessionTitle) sessionTitles.set(options.sessionId, options.sessionTitle);
   const sessionParents = new Map<string, string>();
   const sessionModels = new Map<string, string>();
+  const sessionServiceTiers = new Map<string, 'standard' | 'fast' | 'unknown'>();
+  const tokenTotals = new Map<string, Usage>();
+  const replayActive = new Map<string, boolean>();
+  const hasCodexReplayBoundary = /"(?:type|event)"\s*:\s*"(?:task_started|inter_agent_communication(?:_metadata)?)"/.test(text);
   if (options.sessionId && options.model) sessionModels.set(options.sessionId, options.model);
   const hasTrailingNewline = /\r?\n$/.test(text);
   const lineOffset = options.lineOffset ?? 0;
@@ -891,6 +1000,17 @@ export function parseJsonl(text: string, options: ParseOptions): ParsedJsonl {
       cwd: sourceCwd ?? sessionDirectories.get(sessionId),
     };
     const payload = payloadOf(record);
+    const payloadType = stringValue(payload.type, payload.event, payload.subtype)?.toLowerCase() ?? '';
+    const discoveredTier = serviceTierFromRecord(record);
+    if (discoveredTier) sessionServiceTiers.set(sessionId, discoveredTier);
+    if (provider === 'codex' && hasCodexReplayBoundary && resolvedParent && !replayActive.has(sessionId)) {
+      replayActive.set(sessionId, true);
+    }
+    const replayBoundary = payloadType === 'task_started' || (
+      /inter_agent_communication(?:_metadata)?/.test(type + ' ' + payloadType) &&
+      (record.trigger_turn === true || payload.trigger_turn === true)
+    );
+    if (replayBoundary) replayActive.set(sessionId, false);
     const message = nestedRecord(record, 'message');
     for (const [index, contextSnapshot] of extractContextSnapshots(record).entries()) {
       events.push(makeEvent({ id: sourceFile + ':context:' + String(lineIndex + 1 + lineOffset) + ':' + index, ...base }, {
@@ -1084,8 +1204,14 @@ export function parseJsonl(text: string, options: ParseOptions): ParsedJsonl {
       type.includes('token-count') ||
       type.includes('usage_snapshot') ||
       type.includes('usage-snapshot');
-    const snapshot = isTokenSnapshot ? tokenSnapshotUsage(record) : { usage: findUsage(record), cumulative: false };
-    const usage = snapshot.usage;
+    const snapshot = isTokenSnapshot ? tokenSnapshotUsage(record) : { usage: findUsage(record), cumulative: false, total: undefined };
+    let usage = snapshot.usage;
+    if (isTokenSnapshot && snapshot.total) {
+      const totalKey = [provider, sessionId, actorId, model ?? 'unknown'].join('|');
+      const previousTotal = tokenTotals.get(totalKey);
+      if (previousTotal && sameVector(previousTotal, snapshot.total)) usage = undefined;
+      tokenTotals.set(totalKey, { ...snapshot.total });
+    }
     const isResultSummary = type === 'result' || type === 'final_result';
     if (usage && !(isResultSummary && seenUsageSessions.has(provider + ':' + sessionId))) {
       if (isTokenSnapshot) usage.cumulative = snapshot.cumulative;
@@ -1106,6 +1232,8 @@ export function parseJsonl(text: string, options: ParseOptions): ParsedJsonl {
             text: assistantText,
             scope: isTokenSnapshot ? 'tree' : 'call',
             behavior: classifyModelBehavior(toolUses),
+            replayed: provider === 'codex' && replayActive.get(sessionId) === true,
+            serviceTier: sessionServiceTiers.get(sessionId),
             rawType: type,
           },
         ),
@@ -1245,26 +1373,36 @@ function isMeaningfulUsage(usage?: Usage): boolean {
   );
 }
 
-function usageVector(usage: Usage): [number, number, number, number, number] {
+function usageVector(usage: Usage): [number, number, number, number, number, number, number] {
   return [
     usage.inputTokens,
     usage.cachedInputTokens ?? 0,
     usage.cacheCreationInputTokens ?? 0,
     usage.outputTokens,
     usage.reasoningTokens ?? 0,
+    usage.cacheCreationInputTokens5m ?? 0,
+    usage.cacheCreationInputTokens1h ?? 0,
   ];
 }
 
 function subtractUsage(current: Usage, previous: Usage): Usage {
   const currentVector = usageVector(current);
   const previousVector = usageVector(previous);
-  const delta = currentVector.map((value, index) => Math.max(0, value - previousVector[index]));
+  // Session resume, compaction or source rotation can reset cumulative
+  // counters. Treat the new snapshot as a fresh baseline instead of emitting
+  // zero deltas until it eventually overtakes the old process total.
+  const reset = currentVector.slice(0, 5).some((value, index) => value < previousVector[index]);
+  const delta = reset
+    ? currentVector
+    : currentVector.map((value, index) => value - previousVector[index]);
   return {
     inputTokens: delta[0],
     cachedInputTokens: delta[1],
     cacheCreationInputTokens: delta[2],
     outputTokens: delta[3],
     reasoningTokens: delta[4],
+    cacheCreationInputTokens5m: delta[5],
+    cacheCreationInputTokens1h: delta[6],
     inputIncludesCached: current.inputIncludesCached,
     outputIncludesReasoning: current.outputIncludesReasoning,
   };
@@ -1344,6 +1482,7 @@ function dedupeAndDelta(events: AnalysisEvent[]): AnalysisEvent[] {
   const seenSnapshots = new Map<string, Usage>();
   const result: AnalysisEvent[] = [];
   for (const original of [...events].sort(compareEvents)) {
+    if (original.kind === 'model' && original.replayed) continue;
     const identity = eventKey(original);
     if (seenIds.has(identity)) continue;
     const event = { ...original, usage: original.usage ? { ...original.usage } : undefined };
@@ -1457,9 +1596,19 @@ function combineUsage(...summaries: UsageSummary[]): UsageSummary {
 
 function matchRate(call: AnalysisEvent, rates: RateSnapshot[]): RateSnapshot | undefined {
   const model = (call.model ?? '').toLowerCase();
+  const callTime = call.timestamp ? Date.parse(call.timestamp) : Number.NaN;
   const scored = rates
     .map((rate) => {
       if (rate.provider !== call.provider && rate.provider !== 'unknown') return { rate, score: 0 };
+      if (rate.serviceTier && call.serviceTier && rate.serviceTier !== call.serviceTier) {
+        return { rate, score: 0 };
+      }
+      if (rate.effectiveFrom && (!Number.isFinite(callTime) || callTime < Date.parse(rate.effectiveFrom + 'T00:00:00Z'))) {
+        return { rate, score: 0 };
+      }
+      if (rate.effectiveTo && (!Number.isFinite(callTime) || callTime > Date.parse(rate.effectiveTo + 'T23:59:59.999Z'))) {
+        return { rate, score: 0 };
+      }
       const pattern = rate.modelPattern.toLowerCase();
       let score = 0;
       if (pattern === '*') score = 1;
@@ -1484,10 +1633,12 @@ function matchRate(call: AnalysisEvent, rates: RateSnapshot[]): RateSnapshot | u
     'inputCreditsPerMillion',
     'cachedInputCreditsPerMillion',
     'cacheCreationCreditsPerMillion',
+    'cacheCreation1hCreditsPerMillion',
     'outputCreditsPerMillion',
     'inputUsdPerMillion',
     'cachedInputUsdPerMillion',
     'cacheCreationUsdPerMillion',
+    'cacheCreation1hUsdPerMillion',
     'outputUsdPerMillion',
   ] as const;
   return matches.slice(1).reduce((merged, candidate) => {
@@ -1535,6 +1686,10 @@ function calculateCost(
     const usage = call.usage;
     const cached = cachedInputTokens(usage);
     const cacheCreation = usage.cacheCreationInputTokens ?? 0;
+    const cacheCreation1h = Math.min(usage.cacheCreationInputTokens1h ?? 0, cacheCreation);
+    const cacheCreation5m = usage.cacheCreationInputTokens5m !== undefined
+      ? Math.min(usage.cacheCreationInputTokens5m, Math.max(cacheCreation - cacheCreation1h, 0))
+      : Math.max(cacheCreation - cacheCreation1h, 0);
     breakdown.inputTokens += usage.inputTokens;
     breakdown.cachedInputTokens += cached;
     breakdown.cacheCreationInputTokens += cacheCreation;
@@ -1553,20 +1708,21 @@ function calculateCost(
     const creditInput =
       billableInput * (rate.inputCreditsPerMillion ?? 0) / MILLION +
       cached * (rate.cachedInputCreditsPerMillion ?? 0) / MILLION +
-      cacheCreation * (rate.cacheCreationCreditsPerMillion ?? rate.cachedInputCreditsPerMillion ?? 0) / MILLION;
+      cacheCreation5m * (rate.cacheCreationCreditsPerMillion ?? 0) / MILLION +
+      cacheCreation1h * (rate.cacheCreation1hCreditsPerMillion ?? 0) / MILLION;
     const usdInput =
       billableInput * (rate.inputUsdPerMillion ?? 0) / MILLION +
       cached * (rate.cachedInputUsdPerMillion ?? 0) / MILLION +
-      cacheCreation * (rate.cacheCreationUsdPerMillion ?? rate.cachedInputUsdPerMillion ?? 0) / MILLION;
+      cacheCreation5m * (rate.cacheCreationUsdPerMillion ?? 0) / MILLION +
+      cacheCreation1h * (rate.cacheCreation1hUsdPerMillion ?? 0) / MILLION;
     const output = usage.outputTokens + (usage.outputIncludesReasoning ? 0 : (usage.reasoningTokens ?? 0));
     const creditOutput = output * (rate.outputCreditsPerMillion ?? 0) / MILLION;
     const usdOutput = output * (rate.outputUsdPerMillion ?? 0) / MILLION;
     const creditCallKnown = !(
       (billableInput > 0 && rate.inputCreditsPerMillion === undefined) ||
       (cached > 0 && rate.cachedInputCreditsPerMillion === undefined) ||
-      (cacheCreation > 0 &&
-        rate.cacheCreationCreditsPerMillion === undefined &&
-        rate.cachedInputCreditsPerMillion === undefined) ||
+      (cacheCreation5m > 0 && rate.cacheCreationCreditsPerMillion === undefined) ||
+      (cacheCreation1h > 0 && rate.cacheCreation1hCreditsPerMillion === undefined) ||
       (output > 0 && rate.outputCreditsPerMillion === undefined)
     );
     if (!creditCallKnown) {
@@ -1575,9 +1731,8 @@ function calculateCost(
     const usdCallKnown = !(
       (billableInput > 0 && rate.inputUsdPerMillion === undefined) ||
       (cached > 0 && rate.cachedInputUsdPerMillion === undefined) ||
-      (cacheCreation > 0 &&
-        rate.cacheCreationUsdPerMillion === undefined &&
-        rate.cachedInputUsdPerMillion === undefined) ||
+      (cacheCreation5m > 0 && rate.cacheCreationUsdPerMillion === undefined) ||
+      (cacheCreation1h > 0 && rate.cacheCreation1hUsdPerMillion === undefined) ||
       (output > 0 && rate.outputUsdPerMillion === undefined)
     );
     if (!usdCallKnown) {

@@ -963,13 +963,15 @@ export default function Home() {
     sessions: AnalysisSession[],
     forest?: SessionForest<AnalysisSession>,
     roots?: AnalysisSession[],
-    options?: { present?: { has(key: string): boolean }; childList?: boolean },
+    options?: { present?: { has(key: string): boolean }; childList?: boolean; compact?: boolean },
   ) {
     const tree = forest ?? sessionForest(sessions);
     const rows = sessionTreeRows(sessions, collapsedSessionIds, tree, roots);
     const present = options?.present ?? tree.byKey;
-    return <div className="table-wrap session-table-viewport"><table role="treegrid" aria-label="会话树">
-      <thead><tr><th>目录 - Session</th><th>Agent</th><th>自身 Token</th><th>含子会话</th><th>预估费用</th><th>最近增速</th><th>Tools 字符</th><th>Skills 字符</th><th>最近数据</th></tr></thead>
+    const compact = options?.compact ?? false;
+    const columnCount = compact ? 6 : 9;
+    return <div className="table-wrap session-table-viewport"><table role="treegrid" aria-label={compact ? '最近会话摘要' : '会话树'}>
+      <thead><tr><th>目录 - Session</th><th>Agent</th>{!compact && <th>自身 Token</th>}<th>含子会话</th><th>预估费用</th><th>最近增速</th>{!compact && <><th>Tools 字符</th><th>Skills 字符</th></>}<th>最近数据</th></tr></thead>
       <tbody>{rows.length ? rows.map(({ session, depth, childCount }) => {
         const cost = displayCost(session.inclusiveCost, currency);
         const active = sessionIsActive(session, clockMs);
@@ -990,20 +992,20 @@ export default function Home() {
             </div>
           </td>
           <td><SourceBadge provider={session.provider} /></td>
-          <td className="mono" title={formatExactTokenCount(session.ownUsage.totalTokens)} aria-label={formatExactTokenCount(session.ownUsage.totalTokens)}><TokenFigure value={session.ownUsage.totalTokens} /></td>
+          {!compact && <td className="mono" title={formatExactTokenCount(session.ownUsage.totalTokens)} aria-label={formatExactTokenCount(session.ownUsage.totalTokens)}><TokenFigure value={session.ownUsage.totalTokens} /></td>}
           <td className="mono" title={formatExactTokenCount(session.inclusiveUsage.totalTokens)} aria-label={formatExactTokenCount(session.inclusiveUsage.totalTokens)}><TokenFigure value={session.inclusiveUsage.totalTokens} /></td>
           <td className={'mono cost-' + cost.tone} title={cost.note}>{cost.value}<small>{cost.note}</small></td>
           <td className={'mono growth-cell' + (growth.badge === '当前' ? ' growth-live' : '')} title={growth.caption} aria-label={growth.caption}>
             {clockMs > 0 && growth.badge && <span className={'growth-badge growth-' + (growth.badge === '当前' ? 'live' : 'past')}>{growth.badge}</span>}
             {growth.value}
           </td>
-          {(['tools', 'skills'] as const).map((category) => {
+          {!compact && (['tools', 'skills'] as const).map((category) => {
             const snapshot = contextInventories.get(contextSessionKey(session.provider, session.id))?.[category]?.contextSnapshot;
             return <td key={category}><button className="context-length-link mono" title="最近记录的定义 / 目录字符数，点击查看组成；非 Token 用量" aria-label={category + ' 上下文 · ' + sessionDisplayName(session)} onClick={() => openSession(session, category)}>{snapshot ? snapshot.chars.toLocaleString('en-US') : '未知'}<small>查看组成 ↗</small></button></td>;
           })}
           <td>{formatRelativeTime(session.lastDataAt)}</td>
         </tr>;
-      }) : <tr><td colSpan={9}><EmptyState title="还没有会话" description="导入日志或开始本机采集后查看。" /></td></tr>}</tbody>
+      }) : <tr><td colSpan={columnCount}><EmptyState title="还没有会话" description="导入日志或开始本机采集后查看。" /></td></tr>}</tbody>
     </table></div>;
   }
 
@@ -1012,7 +1014,7 @@ export default function Home() {
     const tree = forest ?? sessionForest(sessions);
     const recentRoots = tree.roots.slice(0, 8);
     return <>
-      {renderSessionTable(sessions, tree, recentRoots)}
+      {renderSessionTable(sessions, tree, recentRoots, { compact: true })}
       {tree.roots.length > recentRoots.length && <p className="table-more-note">已显示最近 {recentRoots.length} 个入口会话（共 {tree.roots.length} 个）。子会话按归属展开，不能再与含子会话合计相加。</p>}
     </>;
   }
@@ -1101,6 +1103,20 @@ export default function Home() {
     const forest = sessionForest(sessions);
     const counts = sessionEntryCounts(sessions, forest);
     const chartMode = trendChartMode(trend);
+    const pricedCalls = overviewAnalysis.calls.reduce((count, call) => (
+      costForCalls([call], rates)[currency] === undefined ? count : count + 1
+    ), 0);
+    const pricingCoverage = overviewAnalysis.calls.length
+      ? Math.round(pricedCalls / overviewAnalysis.calls.length * 100)
+      : 100;
+    const overviewHours = SESSION_TIME_RANGES.find((range) => range.value === overviewTimeRange)?.hours;
+    const replayedCalls = sourceEvents.filter((event) => {
+      if (event.kind !== 'model' || !event.replayed) return false;
+      if (providerFilter !== 'all' && event.provider !== providerFilter) return false;
+      if (overviewHours === undefined) return true;
+      const time = event.timestamp ? Date.parse(event.timestamp) : Number.NaN;
+      return Number.isFinite(time) && time >= overviewRangeNow - overviewHours * 3_600_000 && time <= overviewRangeNow;
+    }).length;
     const sessionCaption = [
       '入口 ' + String(counts.entries),
       '主会话 ' + String(counts.primary),
@@ -1119,6 +1135,16 @@ export default function Home() {
       <MetricCard label="总 Token 用量" value={formatTokenCount(overviewAnalysis.usage.totalTokens)} caption={formatExactTokenCount(overviewAnalysis.usage.totalTokens) + ' · ' + String(overviewAnalysis.calls.length) + ' 个模型调用'} icon="◎" title={'未缓存 ' + formatExactTokenCount(composition.uncached) + ' · 缓存 ' + formatExactTokenCount(composition.cached) + ' · 输出 ' + formatExactTokenCount(composition.output)} />
       <MetricCard label="疑似可优化费用" value={overviewCandidate.value} caption={share.percent === undefined ? share.note : String(share.percent) + '% ' + share.note} icon="↗" accent title="仅计入可计价的纯异常调用，混合、基线与必要操作不在内" tone={overviewCandidate.tone} />
       <MetricCard label="入口会话" value={String(counts.entries)} caption={sessionCaption} icon="▤" />
+    </section>
+    <section className="trust-strip" aria-label="分析可信度摘要">
+      <div className="trust-item">
+        <span>计价覆盖</span>
+        <strong>{pricedCalls}/{overviewAnalysis.calls.length} 调用</strong>
+        <div className="coverage-track" role="progressbar" aria-label="当前费用单位计价覆盖率" aria-valuemin={0} aria-valuemax={100} aria-valuenow={pricingCoverage}><i style={{ width: pricingCoverage + '%' }} /></div>
+      </div>
+      <div className="trust-item"><span>数据完整性</span><strong>{completenessLabel(overviewAnalysis)}</strong><small>{overviewAnalysis.errors.length ? overviewAnalysis.errors.length + ' 条记录已隔离' : '未发现解析错误'}</small></div>
+      <div className="trust-item"><span>去重保护</span><strong>{replayedCalls ? '排除 ' + replayedCalls + ' 条回放' : '未发现子会话回放'}</strong><small>复制导出与累计快照也会去重</small></div>
+      <div className="trust-item"><span>最后数据</span><strong>{formatRelativeTime(overviewAnalysis.lastDataAt)}</strong><small>{dataFreshnessLabel(dataFreshness(overviewAnalysis.lastDataAt, clockMs), collectorStatus === 'collecting')}</small></div>
     </section>
     <section className="charts-grid">
       <article className="panel trend-panel">
@@ -1340,7 +1366,7 @@ export default function Home() {
       setRateDraft((current) => ({ ...current, input: '', cached: '', output: '' }));
       setCollectorMessage('自定义费率已保存；它只影响后续本地估算');
     }
-    return <section className="view-stack"><div className="view-intro"><div><span className="eyebrow">LOCAL PREFERENCES</span><h2>计费与规则</h2><p>费用是基于已记录用量和适用费率的估算，不是官方账单。</p></div><div className="currency-switch" role="group" aria-label="默认货币单位"><button className={currency === 'usd' ? 'selected' : ''} onClick={() => setCurrencyAndSave('usd')}>USD</button><button className={currency === 'credits' ? 'selected' : ''} onClick={() => setCurrencyAndSave('credits')}>Credits</button></div></div><div className="settings-grid"><article className="panel settings-panel"><div className="panel-heading"><div><h2>费率快照</h2><p>官方快照与用户自定义依据分开显示</p></div></div><div className="rate-list">{allRates.map((rate) => <div className="rate-row" key={rate.id}><div><SourceBadge provider={rate.provider} /><strong>{rate.modelPattern}</strong><small>{rate.source} · 核对于 {rate.checkedDate}</small></div><div className="rate-values">{rate.inputUsdPerMillion !== undefined && <span>{'$' + String(rate.inputUsdPerMillion)}/M input</span>}{rate.inputCreditsPerMillion !== undefined && <span>{rate.inputCreditsPerMillion} credits/M input</span>}<small>{rate.kind === 'custom' ? '自定义' : '官方快照'}</small></div>{rate.kind === 'custom' && <button className="icon-button" onClick={() => setPreferences((current) => ({ ...current, customRates: current.customRates.filter((item) => item.id !== rate.id) }))} aria-label={'删除 ' + rate.modelPattern}>×</button>}</div>)}{!allRates.length && <EmptyState title="暂无费率" description="未知费率仍可查看 Token 和异常证据。" />}</div></article><article className="panel settings-panel"><div className="panel-heading"><div><h2>添加自定义费率</h2><p>金额按每百万 Token 录入</p></div></div><form className="rate-form" onSubmit={addRate}><label>来源<select value={rateDraft.provider} onChange={(event) => setRateDraft((current) => ({ ...current, provider: event.target.value as Provider }))}><option value="codex">Codex</option><option value="claude">Claude Code</option><option value="unknown">未知来源</option></select></label><label>模型匹配<input value={rateDraft.modelPattern} onChange={(event) => setRateDraft((current) => ({ ...current, modelPattern: event.target.value }))} placeholder="例如 claude-sonnet-4 或 *" /></label><label>单位<select value={rateDraft.unit} onChange={(event) => setRateDraft((current) => ({ ...current, unit: event.target.value as Currency }))}><option value="usd">USD / M</option><option value="credits">Credits / M</option></select></label><div className="rate-input-grid"><label>输入<input inputMode="decimal" value={rateDraft.input} onChange={(event) => setRateDraft((current) => ({ ...current, input: event.target.value }))} placeholder="1.00" /></label><label>缓存输入<input inputMode="decimal" value={rateDraft.cached} onChange={(event) => setRateDraft((current) => ({ ...current, cached: event.target.value }))} placeholder="0.10" /></label><label>输出<input inputMode="decimal" value={rateDraft.output} onChange={(event) => setRateDraft((current) => ({ ...current, output: event.target.value }))} placeholder="5.00" /></label></div><label>依据说明<input value={rateDraft.source} onChange={(event) => setRateDraft((current) => ({ ...current, source: event.target.value }))} /></label><button className="button primary full-button" type="submit">保存费率</button></form></article></div><div className="settings-grid"><article className="panel settings-panel"><div className="panel-heading"><div><h2>初始异常规则</h2><p>规则命中代表值得检查，不代表已经证明浪费</p></div></div><div className="rule-list"><div><span className="rule-number">01</span><div><strong>疑似重复读取</strong><p>同一主体、文件、范围与内容，5 分钟内至少 3 次。</p></div></div><div><span className="rule-number">02</span><div><strong>疑似轮询空转</strong><p>同一目标连续 3 次纯 wait/poll，间隔不超过 60 秒且无状态变化。</p></div></div><div><span className="rule-number">03</span><div><strong>疑似压缩循环</strong><p>10 分钟内至少两轮“压缩 → 重读相同内容”。</p></div></div></div></article><article className="panel settings-panel privacy-panel"><div className="privacy-large-icon">◇</div><h2>本地优先</h2><p>原始日志只在设备内读取与分析。关闭网页不会停止本地服务；停止采集会保留当前结果，清除会话才会丢弃临时内容。</p><div className="service-actions"><span className="service-state"><i />{collectorMessage}</span><button className="button secondary" onClick={clearSession}>清除本次数据</button></div></article></div><article className="panel compatibility-panel"><div className="panel-heading"><div><h2>解析范围与证据边界</h2><p>支持声明只覆盖已实现的通用字段；实际日志版本仍需样本验证。</p></div><span className="count-badge">本地只读</span></div><div className="compatibility-grid"><div><strong>Codex JSONL</strong><p>识别 token_count 累计快照、function_call / output、用户请求、父会话和常见文件范围。</p></div><div><strong>Claude Code JSONL</strong><p>识别 assistant usage、tool_use / tool_result、result 汇总、缓存字段和上下文压缩标记。</p></div><div><strong>缺失与未知</strong><p>坏行、截断输出、未匹配费率或无法确认归属会保留证据并标为部分/未知，不静默填零。</p></div></div></article></section>;
+    return <section className="view-stack"><div className="view-intro"><div><span className="eyebrow">LOCAL PREFERENCES</span><h2>计费与规则</h2><p>费用是基于已记录用量和适用费率的估算，不是官方账单。</p></div><div className="currency-switch" role="group" aria-label="默认货币单位"><button className={currency === 'usd' ? 'selected' : ''} onClick={() => setCurrencyAndSave('usd')}>USD</button><button className={currency === 'credits' ? 'selected' : ''} onClick={() => setCurrencyAndSave('credits')}>Credits</button></div></div><div className="settings-grid"><article className="panel settings-panel"><div className="panel-heading"><div><h2>费率快照</h2><p>官方快照与用户自定义依据分开显示</p></div></div><div className="rate-list">{allRates.map((rate) => <div className="rate-row" key={rate.id}><div><SourceBadge provider={rate.provider} /><strong>{rate.modelPattern}</strong><small>{rate.source} · 核对于 {rate.checkedDate}</small></div><div className="rate-values">{rate.inputUsdPerMillion !== undefined && <span>{'$' + String(rate.inputUsdPerMillion)}/M input</span>}{rate.inputCreditsPerMillion !== undefined && <span>{rate.inputCreditsPerMillion} credits/M input</span>}<small>{rate.kind === 'custom' ? '自定义' : '官方快照'}</small></div>{rate.kind === 'custom' && <button className="icon-button" onClick={() => setPreferences((current) => ({ ...current, customRates: current.customRates.filter((item) => item.id !== rate.id) }))} aria-label={'删除 ' + rate.modelPattern}>×</button>}</div>)}{!allRates.length && <EmptyState title="暂无费率" description="未知费率仍可查看 Token 和异常证据。" />}</div></article><article className="panel settings-panel"><div className="panel-heading"><div><h2>添加自定义费率</h2><p>金额按每百万 Token 录入</p></div></div><form className="rate-form" onSubmit={addRate}><label>来源<select value={rateDraft.provider} onChange={(event) => setRateDraft((current) => ({ ...current, provider: event.target.value as Provider }))}><option value="codex">Codex</option><option value="claude">Claude Code</option><option value="unknown">未知来源</option></select></label><label>模型匹配<input value={rateDraft.modelPattern} onChange={(event) => setRateDraft((current) => ({ ...current, modelPattern: event.target.value }))} placeholder="例如 claude-sonnet-4 或 *" /></label><label>单位<select value={rateDraft.unit} onChange={(event) => setRateDraft((current) => ({ ...current, unit: event.target.value as Currency }))}><option value="usd">USD / M</option><option value="credits">Credits / M</option></select></label><div className="rate-input-grid"><label>输入<input inputMode="decimal" value={rateDraft.input} onChange={(event) => setRateDraft((current) => ({ ...current, input: event.target.value }))} placeholder="1.00" /></label><label>缓存输入<input inputMode="decimal" value={rateDraft.cached} onChange={(event) => setRateDraft((current) => ({ ...current, cached: event.target.value }))} placeholder="0.10" /></label><label>输出<input inputMode="decimal" value={rateDraft.output} onChange={(event) => setRateDraft((current) => ({ ...current, output: event.target.value }))} placeholder="5.00" /></label></div><label>依据说明<input value={rateDraft.source} onChange={(event) => setRateDraft((current) => ({ ...current, source: event.target.value }))} /></label><button className="button primary full-button" type="submit">保存费率</button></form></article></div><div className="settings-grid"><article className="panel settings-panel"><div className="panel-heading"><div><h2>初始异常规则</h2><p>规则命中代表值得检查，不代表已经证明浪费</p></div></div><div className="rule-list"><div><span className="rule-number">01</span><div><strong>疑似重复读取</strong><p>同一主体、文件、范围与内容，5 分钟内至少 3 次。</p></div></div><div><span className="rule-number">02</span><div><strong>疑似轮询空转</strong><p>同一目标连续 3 次纯 wait/poll，间隔不超过 60 秒且无状态变化。</p></div></div><div><span className="rule-number">03</span><div><strong>疑似压缩循环</strong><p>10 分钟内至少两轮“压缩 → 重读相同内容”。</p></div></div></div></article><article className="panel settings-panel privacy-panel"><div className="privacy-large-icon">◇</div><h2>本地优先</h2><p>原始日志只在设备内读取与分析。关闭网页不会停止本地服务；停止采集会保留当前结果，清除会话才会丢弃临时内容。</p><div className="service-actions"><span className="service-state"><i />{collectorMessage}</span><button className="button secondary" onClick={clearSession}>清除本次数据</button></div></article></div><article className="panel compatibility-panel"><div className="panel-heading"><div><h2>解析范围与证据边界</h2><p>支持声明只覆盖已实现的通用字段；实际日志版本仍需样本验证。</p></div><span className="count-badge">本地只读</span></div><div className="compatibility-grid"><div><strong>Codex JSONL</strong><p>优先采用 last_token_usage，识别累计快照重置、Fast 模式和有明确标记的子会话历史回放。</p></div><div><strong>Claude Code JSONL</strong><p>识别 assistant usage、工具结果、5 分钟 / 1 小时缓存写入分项及来源费用汇总。</p></div><div><strong>缺失与未知</strong><p>坏行、截断输出、未匹配费率或无法确认归属会保留证据并标为部分/未知，不静默填零。</p></div></div></article></section>;
   }
 
   return (
@@ -1402,13 +1428,25 @@ export default function Home() {
               <p>{view === 'overview' ? '看清哪次会话在消耗、增长有多快、哪里值得检查。' : '保留记录、估算和证据，让每个判断都能回到原始会话。'}</p>
             </div>
           </div>
-          <div className="source-bar">
-            <input className="path-input" value={livePath} onChange={(event) => setLivePath(event.target.value)} placeholder="~/.codex（含 sessions 与 archived_sessions）或 Claude 日志目录" aria-label="本机日志目录路径" />
-            <button className="button secondary" onClick={analysisMode === 'live' && collectorStatus === 'collecting' ? stopCollection : handleLiveStart} disabled={collectorStatus === 'loading'}>
-              {analysisMode === 'live' && collectorStatus === 'collecting' ? '■ 停止采集' : '◉ 开始本机采集'}
-            </button>
-            <button className="button primary" onClick={() => fileInputRef.current?.click()} disabled={collectorStatus === 'loading'}>＋ 导入 Session</button>
-            <input ref={fileInputRef} className="visually-hidden" type="file" accept=".jsonl,.json,.ndjson,.log" multiple onChange={(event) => { if (event.target.files) void handleFiles(event.target.files); event.currentTarget.value = ''; }} />
+          <div className="source-command">
+            <div className="source-command-copy">
+              <span className="source-kicker">LOCAL SOURCE</span>
+              <div><strong>{analysisMode === 'demo' ? '连接你的会话日志' : sourceLabel}</strong><small>只读取你指定的目录；输入路径不会自动开始扫描</small></div>
+            </div>
+            <div className="source-bar">
+              <input className="path-input" value={livePath} onChange={(event) => setLivePath(event.target.value)} placeholder="~/.codex（含 sessions 与 archived_sessions）或 Claude 日志目录" aria-label="本机日志目录路径" />
+              <button className="button secondary" onClick={analysisMode === 'live' && collectorStatus === 'collecting' ? stopCollection : handleLiveStart} disabled={collectorStatus === 'loading'}>
+                {analysisMode === 'live' && collectorStatus === 'collecting' ? '■ 停止采集' : '◉ 开始本机采集'}
+              </button>
+              <button className="button primary" onClick={() => fileInputRef.current?.click()} disabled={collectorStatus === 'loading'}>＋ 导入 Session</button>
+              <input ref={fileInputRef} className="visually-hidden" type="file" accept=".jsonl,.json,.ndjson,.log" multiple onChange={(event) => { if (event.target.files) void handleFiles(event.target.files); event.currentTarget.value = ''; }} />
+            </div>
+            <div className="source-presets" aria-label="常用日志目录">
+              <span>常用路径</span>
+              <button type="button" onClick={() => setLivePath('~/.codex')}>Codex · ~/.codex</button>
+              <button type="button" onClick={() => setLivePath('~/.claude/projects')}>Claude · ~/.claude/projects</button>
+              <small>点击仅填入路径</small>
+            </div>
           </div>
           <div className="filter-row">
             <div className="segmented" role="group" aria-label="Agent 筛选">
