@@ -416,6 +416,68 @@ test('converts cumulative snapshots to deltas without inflating a long session',
   assert.equal(analysis.calls.length, 3);
 });
 
+test('treats a reset cumulative snapshot as a new baseline instead of losing usage', () => {
+  const analysis = buildAnalysis([
+    event({ id: 'before-reset', sourceLine: 1, scope: 'tree', usage: { inputTokens: 100, outputTokens: 10, cumulative: true } }),
+    event({ id: 'after-reset', sourceLine: 2, scope: 'tree', usage: { inputTokens: 20, outputTokens: 2, cumulative: true } }),
+  ], [rate]);
+
+  assert.equal(analysis.usage.totalTokens, 132);
+  assert.equal(analysis.calls.length, 2);
+});
+
+test('excludes Codex subagent replay before an explicit child-turn boundary', () => {
+  const parsed = parseJsonl([
+    JSON.stringify({ type: 'session_meta', payload: { id: 'child', parent_session_id: 'parent' } }),
+    JSON.stringify({ timestamp: iso(0), type: 'event_msg', payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 100, output_tokens: 10 }, total_token_usage: { input_tokens: 100, output_tokens: 10 } } } }),
+    JSON.stringify({ timestamp: iso(1), type: 'event_msg', payload: { type: 'task_started' } }),
+    JSON.stringify({ timestamp: iso(2), type: 'event_msg', payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 20, output_tokens: 2 }, total_token_usage: { input_tokens: 120, output_tokens: 12 } } } }),
+  ].join('\n'), { provider: 'codex', sourceFile: 'child.jsonl' });
+  const analysis = buildAnalysis(parsed.events, [rate]);
+
+  assert.equal(parsed.events.filter((item) => item.replayed).length, 1);
+  assert.equal(analysis.calls.length, 1);
+  assert.equal(analysis.usage.totalTokens, 22);
+});
+
+test('prices Claude cache creation duration buckets independently from cache reads', () => {
+  const claudeRate: RateSnapshot = {
+    ...rate,
+    id: 'claude-cache-rate',
+    provider: 'claude',
+    inputUsdPerMillion: 1,
+    cachedInputUsdPerMillion: 0.1,
+    cacheCreationUsdPerMillion: 1.25,
+    cacheCreation1hUsdPerMillion: 2,
+  };
+  const parsed = parseJsonl(JSON.stringify({
+    type: 'assistant', session_id: 'claude-cache', timestamp: iso(0),
+    message: { id: 'cache-call', model: 'claude-sonnet-4', usage: {
+      input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 100_000,
+      cache_creation_input_tokens: 300_000,
+      cache_creation: { ephemeral_5m_input_tokens: 100_000, ephemeral_1h_input_tokens: 200_000 },
+    } },
+  }), { provider: 'claude', sourceFile: 'cache.jsonl' });
+  const analysis = buildAnalysis(parsed.events, [claudeRate]);
+
+  assert.ok(Math.abs((analysis.cost.usd ?? 0) - 0.535) < 1e-12);
+  assert.equal(analysis.cost.usdComplete, true);
+});
+
+test('does not apply standard Codex credit rates to a recorded Fast call', () => {
+  const parsed = parseJsonl([
+    JSON.stringify({ type: 'session_meta', payload: { id: 'fast-session' } }),
+    JSON.stringify({ timestamp: iso(0), type: 'event_msg', payload: { type: 'thread_settings_applied', thread_settings: { service_tier: 'priority' } } }),
+    JSON.stringify({ timestamp: iso(1), type: 'turn_context', payload: { model: 'gpt-5.6-sol' } }),
+    JSON.stringify({ timestamp: iso(2), type: 'event_msg', payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 100, output_tokens: 10 }, total_token_usage: { input_tokens: 100, output_tokens: 10 } } } }),
+  ].join('\n'), { provider: 'codex', sourceFile: 'fast.jsonl' });
+  const analysis = buildAnalysis(parsed.events, defaultRateSnapshots);
+
+  assert.equal(analysis.calls[0]?.serviceTier, 'fast');
+  assert.equal(analysis.cost.credits, undefined);
+  assert.equal(analysis.cost.unknownCalls, 1);
+});
+
 test('shows a known cost subtotal when another model has no matching rate', () => {
   const knownRate = { ...rate, modelPattern: 'gpt-5.6-sol' };
   const analysis = buildAnalysis([
