@@ -22,6 +22,7 @@ import {
   paginate,
   SESSION_TIME_RANGES,
   sessionCollapseKey,
+  sessionCompletenessCaption,
   sessionDisplayName,
   sessionEntryCounts,
   sessionForest,
@@ -887,7 +888,7 @@ export default function Home() {
                 : <span className="tree-branch">{depth ? '└' : ''}</span>}
               <button className="session-link" title={sessionDisplayName(session)} onClick={() => openSession(session)}>
                 <strong>{sessionDisplayName(session)}</strong>
-                <small>{role} · {session.id}</small>
+                <small>{role} · {session.id}{sessionCompletenessCaption(session.completeness) ? ' · ' + sessionCompletenessCaption(session.completeness) : ''}</small>
               </button>
             </div>
           </td>
@@ -1137,6 +1138,7 @@ export default function Home() {
           <div><span>含子会话 Token</span><strong aria-label={formatExactTokenCount(selectedSession.inclusiveUsage.totalTokens)}><TokenFigure value={selectedSession.inclusiveUsage.totalTokens} /></strong></div>
           <div><span>预估费用 · 含子会话</span><strong>{displayCost(selectedSession.inclusiveCost, currency).value}</strong><small>{displayCost(selectedSession.inclusiveCost, currency).note}</small></div>
         </div>
+        {sessionCompletenessCaption(selectedSession.completeness) && <p className="detail-note">{sessionCompletenessCaption(selectedSession.completeness)}：已知小计仍可查看，未知内容不会被填成零。</p>}
         <div className="detail-navigation" role="group" aria-label="会话详情分区">
           <button aria-pressed={detailSection === 'summary'} onClick={() => setDetailSection('summary')}>概览</button>
           <button aria-pressed={detailSection === 'calls'} onClick={() => setDetailSection('calls')}>调用明细</button>

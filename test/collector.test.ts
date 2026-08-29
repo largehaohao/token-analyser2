@@ -14,6 +14,8 @@ test('accepts session log extensions and ignores other files', () => {
   assert.equal(isSessionLogFile('nested/run.ndjson'), true);
   assert.equal(isSessionLogFile('notes.md'), false);
   assert.equal(isSessionLogFile('.DS_Store'), false);
+  assert.equal(isSessionLogFile('metadata.json'), false);
+  assert.equal(isSessionLogFile('package.json'), false);
 });
 
 test('holds back an incomplete trailing line until the newline arrives', () => {
@@ -261,6 +263,59 @@ test('scans Codex root sessions without ingesting unrelated JSON files', async (
     analysis?.sessions.map((session) => session.id).sort(),
     ['active', 'archived'],
   );
+});
+
+test('attaches a later tool output to an earlier call across collector polls', async () => {
+  const log = '/logs/live.jsonl';
+  const callLine = JSON.stringify({
+    timestamp: '2026-08-28T12:00:01.000Z',
+    type: 'response_item',
+    payload: {
+      type: 'function_call',
+      call_id: 'read-1',
+      name: 'read_file',
+      arguments: JSON.stringify({ path: 'src/app.ts' }),
+    },
+  }) + '\n';
+  const outputLine = JSON.stringify({
+    timestamp: '2026-08-28T12:00:02.000Z',
+    type: 'response_item',
+    payload: {
+      type: 'function_call_output',
+      call_id: 'read-1',
+      output: 'export function app() { return 1 }',
+    },
+  }) + '\n';
+  const fs = memoryFs({ [log]: callLine });
+  const collector = createCollector(fs);
+  await collector.start('/logs');
+  const first = collector.snapshot().analysis?.events.find((item) => item.kind === 'tool');
+  assert.equal(first?.complete, false);
+
+  fs.write(log, callLine + outputLine);
+  await collector.poll();
+  const second = collector.snapshot().analysis?.events.find((item) => item.kind === 'tool');
+  assert.equal(second?.complete, true);
+  assert.equal(second?.toolOutput, 'export function app() { return 1 }');
+  assert.ok(second?.contentHash);
+});
+
+test('generic directories skip metadata json files', async () => {
+  const fs = memoryFs({
+    '/logs/metadata.json': '{"not":"a session"}',
+    '/logs/session.jsonl': JSON.stringify({
+      type: 'assistant',
+      session_id: 'keep-me',
+      message: { id: 'keep', model: 'gpt-5.6-sol', usage: { input_tokens: 10, output_tokens: 1 } },
+    }) + '\n',
+  });
+  const collector = createCollector(fs);
+  await collector.start('/logs');
+  const analysis = collector.snapshot().analysis;
+  assert.equal(analysis?.errors.length ?? 0, 0);
+  assert.equal(analysis?.calls.length, 1);
+  assert.equal(analysis?.sessions[0]?.id, 'keep-me');
+  assert.equal(analysis?.events.some((item) => item.sourceFile?.includes('metadata')), false);
 });
 
 test('exposes a lightweight status snapshot without forcing analysis rebuilds', async () => {

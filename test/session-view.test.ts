@@ -18,6 +18,7 @@ import {
   formatGrowthCaption,
   anomalyBelongsToSession,
   compareSessionGrowth,
+  sessionCompletenessCaption,
   sessionEntryCounts,
   sessionForest,
   sessionGrowthRate,
@@ -33,7 +34,7 @@ import {
   tokenComposition,
   trendChartMode,
 } from '../lib/session-view';
-import { buildAnalysis, formatExactTokenCount, formatTokenCount, parseJsonl, usageTokenCount, type AnalysisEvent, type CostSummary } from '../lib/analysis';
+import { buildAnalysis, createDemoAnalysis, formatExactTokenCount, formatTokenCount, parseJsonl, usageTokenCount, type AnalysisEvent, type CostSummary } from '../lib/analysis';
 
 test('session labels use directory basename and explicit title with honest fallbacks', () => {
   assert.equal(sessionDisplayName({ id: 'abc', title: '优化 UI', cwd: '/projects/token-analyser2/' }), 'token-analyser2 - 优化 UI');
@@ -253,6 +254,22 @@ test('growth sort ranks by window rate rather than wall-clock recency', () => {
     sessionTreeRows(sorted, new Set(), forest).map((row) => row.session.id),
     ['older', 'recent'],
   );
+});
+
+test('session completeness caption uses 数据不完整 vocabulary', () => {
+  assert.equal(sessionCompletenessCaption('complete'), undefined);
+  assert.equal(sessionCompletenessCaption('partial'), '部分数据');
+  assert.equal(sessionCompletenessCaption('unknown'), '数据不完整');
+});
+
+test('demo growth ranking differs from recency ranking', () => {
+  const analysis = createDemoAnalysis();
+  const roots = analysis.sessions.filter((session) => !session.parentSessionId);
+  const byGrowth = [...roots].sort(compareSessionGrowth).map((session) => session.id);
+  const byRecency = [...roots].sort((left, right) =>
+    (Date.parse(right.lastDataAt ?? '') || 0) - (Date.parse(left.lastDataAt ?? '') || 0),
+  ).map((session) => session.id);
+  assert.notDeepEqual(byGrowth, byRecency);
 });
 
 test('displayCost does not present a missing rate as a billed zero', () => {

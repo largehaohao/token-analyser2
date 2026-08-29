@@ -462,6 +462,23 @@ test('does not merge same session ids across providers', () => {
   assert.equal(analysis.sessions.filter((item) => item.id === 'shared-id').length, 2);
 });
 
+test('keeps model calls that share an event id across providers', () => {
+  const analysis = buildAnalysis([
+    event({ id: 'call-1', provider: 'codex', sessionId: 'codex-s', usage: { inputTokens: 10, outputTokens: 1 } }),
+    event({
+      id: 'call-1',
+      provider: 'claude',
+      sessionId: 'claude-s',
+      model: 'claude-sonnet-4',
+      usage: { inputTokens: 20, outputTokens: 2 },
+    }),
+  ], [rate, { ...rate, id: 'claude-rate', provider: 'claude' }]);
+
+  assert.equal(analysis.calls.length, 2);
+  assert.equal(analysis.usage.totalTokens, 33);
+  assert.equal(analysis.sessions.length, 2);
+});
+
 test('deduplicates the same session exported into multiple source files', () => {
   const jsonl = [
     JSON.stringify({ type: 'session_meta', payload: { id: 'shared-session' } }),
@@ -597,6 +614,31 @@ test('fills a custom USD snapshot with the matching official credits fields', ()
   assert.equal(analysis.cost.usd, 1);
   assert.equal(analysis.cost.credits, 100);
   assert.equal(analysis.cost.complete, true);
+  assert.match(analysis.cost.basis, /test fixture/);
+});
+
+test('custom wildcard rates override official USD and keep the custom basis', () => {
+  const customStar: RateSnapshot = {
+    id: 'custom-star',
+    provider: 'codex',
+    modelPattern: '*',
+    inputUsdPerMillion: 999,
+    outputUsdPerMillion: 999,
+    source: 'user custom wildcard',
+    checkedDate: '2026-08-29',
+    applicability: 'override attempt',
+    kind: 'custom',
+  };
+  const call = event({
+    id: 'priced',
+    model: 'gpt-5.6-sol',
+    usage: { inputTokens: 1_000_000, outputTokens: 0 },
+  });
+  const analysis = buildAnalysis([call], [customStar, ...defaultRateSnapshots]);
+
+  assert.equal(analysis.cost.usd, 999);
+  assert.match(analysis.cost.basis, /user custom wildcard/);
+  assert.doesNotMatch(analysis.cost.basis, /Help Center/);
 });
 
 test('keeps a source reported result cost as an estimate when token detail is absent', () => {
@@ -718,6 +760,8 @@ test('does not mark a wait tool as pure wait when its result is missing', () => 
   const wait = parsed.events.find((item) => item.toolName === 'wait_for_agent');
 
   assert.equal(wait?.pureWait, false);
+  assert.equal(wait?.complete, false);
+  assert.equal(buildAnalysis(parsed.events, [rate]).completeness, 'partial');
 });
 
 test('records parentUuid from session metadata onto the child analysis unit', () => {
@@ -794,6 +838,25 @@ test('isolates a file read failure while retaining other directory documents', a
   assert.match(documents.find((item) => item.name === 'locked.jsonl')?.error ?? '', /permission denied/);
 });
 
+test('skips rereading a directory file when lastModified is unchanged', async () => {
+  let reads = 0;
+  const goodFile = {
+    name: 'cached.jsonl',
+    lastModified: 42,
+    text: async () => {
+      reads += 1;
+      return '{"type":"assistant"}';
+    },
+  } as unknown as File;
+  const handle = { name: 'cached.jsonl', getFile: async () => goodFile };
+  const first = await readHandleDocuments([{ handle, relativePath: 'cached.jsonl' }]);
+  const second = await readHandleDocuments([{ handle, relativePath: 'cached.jsonl' }], first);
+
+  assert.equal(first[0]?.content, '{"type":"assistant"}');
+  assert.equal(second[0]?.content, '{"type":"assistant"}');
+  assert.equal(reads, 1);
+});
+
 test('overview scopes normalized deltas and keeps all-time analysis unchanged', () => {
   const full = buildAnalysis([100, 150, 200].map((inputTokens, index) => event({
     id: `window-snapshot-${index}`, sourceLine: index + 1, timestamp: iso(index * 60),
@@ -868,6 +931,36 @@ test('overview never allocates a whole-session reported bill into a time window'
   const scoped = scopeAnalysis(full, { since: Date.parse(iso(0)), until: Date.parse(iso(60)) });
   assert.equal(scoped.cost.usd, 0);
   assert.equal(scoped.calls.length, 0);
+});
+
+test('scoped windows do not inherit parse errors from events outside the range', () => {
+  const full = buildAnalysis(
+    [event({ id: 'old', timestamp: iso(0), usage: { inputTokens: 1, outputTokens: 0 } })],
+    [rate],
+    { errors: [{ sourceFile: 'x.jsonl', line: 1, message: 'bad' }] },
+  );
+  assert.equal(full.completeness, 'partial');
+  const scoped = scopeAnalysis(full, { since: Date.parse(iso(60)), until: Date.parse(iso(120)) });
+  assert.equal(scoped.calls.length, 0);
+  assert.equal(scoped.errors.length, 0);
+  assert.equal(scoped.completeness, 'complete');
+});
+
+test('session lastDataAt follows parsed time, not string order', () => {
+  const analysis = buildAnalysis([
+    event({
+      id: 'offset',
+      timestamp: '2026-08-28T10:00:00-07:00',
+      usage: { inputTokens: 1, outputTokens: 0 },
+    }),
+    event({
+      id: 'utc',
+      timestamp: '2026-08-28T16:00:00.000Z',
+      usage: { inputTokens: 2, outputTokens: 0 },
+    }),
+  ], [rate]);
+  assert.equal(analysis.sessions[0]?.lastDataAt, '2026-08-28T10:00:00-07:00');
+  assert.equal(analysis.lastDataAt, '2026-08-28T10:00:00-07:00');
 });
 
 test('overview retains a child active in the window without importing parent usage', () => {

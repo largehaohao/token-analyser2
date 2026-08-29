@@ -1,5 +1,7 @@
 export function isSessionLogFile(name: string): boolean {
-  return /\.(jsonl|json|ndjson|log)$/i.test(name.split('/').at(-1) ?? name);
+  const base = name.split('/').at(-1) ?? name;
+  if (/^(metadata|package(-lock)?|tsconfig.*|jsconfig.*|composer)\.json$/i.test(base)) return false;
+  return /\.(jsonl|json|ndjson|log)$/i.test(base);
 }
 
 export function consumeJsonlChunk(
