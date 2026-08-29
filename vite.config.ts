@@ -19,7 +19,7 @@ function loopbackDualBindPlugin(): Plugin {
     configureServer(server) {
       const httpServer = server.httpServer;
       if (!httpServer) return;
-      httpServer.once('listening', () => {
+      const bindExtra = () => {
         void attachExtraLoopback(httpServer, server.middlewares as import('node:http').RequestListener).then((extra) => {
           if (!extra) return;
           const closeExtra = () => extra.close();
@@ -29,7 +29,9 @@ function loopbackDualBindPlugin(): Plugin {
           }
           httpServer.once('close', closeExtra);
         });
-      });
+      };
+      if (httpServer.listening) bindExtra();
+      else httpServer.once('listening', bindExtra);
     },
   };
 }

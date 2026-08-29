@@ -191,7 +191,7 @@ h3 { font-size: 13px; line-height: 1.4; font-weight: 600; }
 
 .sessions-panel .panel-heading { padding: 17px 20px; }
 .panel-hint { color: #6e7f6d; font-size: 9px; }
-.table-wrap { width: 100%; max-width: 100%; min-width: 0; overflow-x: auto; }
+.table-wrap { position: relative; width: 100%; max-width: 100%; min-width: 0; overflow: auto; }
 table { width: 100%; border-collapse: collapse; white-space: nowrap; }
 th { padding: 10px 20px; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); background: #111710; color: #71816d; text-align: left; font-size: 11px; font-weight: 450; }
 td { padding: 13px 20px; border-bottom: 1px solid var(--border-soft); color: #b9c8b3; font-size: 12px; }
@@ -352,7 +352,7 @@ td small { display: block; margin-top: 4px; color: #71806d; font-size: 10px; }
 .token-cached { background: #5686d8; }
 .token-cache-write { background: #d8aa64; }
 .token-output { background: #b88ad3; }
-.call-table-viewport { max-height: 56vh; overflow: auto; border: 1px solid var(--border-soft); border-radius: 6px; }
+.call-table-viewport { position: relative; max-height: 56vh; max-width: 100%; overflow: auto; border: 1px solid var(--border-soft); border-radius: 6px; }
 .call-table { table-layout: fixed; min-width: 900px; width: 100%; font-size: 11px; }
 .call-table th, .call-table td { padding: 11px 8px; border-right: 1px solid var(--border-soft); border-bottom: 1px solid var(--border-soft); }
 .call-table th { position: sticky; top: 0; z-index: 1; background: #11180f; color: #87947f; font-size: 11px; }
@@ -489,7 +489,7 @@ td small { display: block; margin-top: 4px; color: #71806d; font-size: 10px; }
 .page-footer { display: flex; align-items: center; justify-content: space-between; gap: 15px; margin-top: 22px; color: #5e705c; font-size: 8px; }.page-footer > span:first-child { display: inline-flex; align-items: center; gap: 5px; }.tiny-dot { width: 4px; height: 4px; display: inline-block; border-radius: 50%; background: var(--green-deep); }
 
 .overview-date-filter { margin-bottom: 20px; }
-.trend-panel .bar-chart { overflow-x: auto; overflow-y: hidden; }
+.trend-panel .bar-chart { position: relative; overflow-x: auto; overflow-y: hidden; }
 .filter-row-end { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; justify-content: flex-end; }
 .demo-banner { display: flex; align-items: flex-start; gap: 12px; margin: -4px 0 20px; padding: 12px 14px; border: 1px dashed #5a6f3d; border-radius: 8px; background: rgba(38, 52, 28, .55); color: #d5e7c4; }
 .demo-banner > span { display: inline-flex; align-items: center; padding: 2px 7px; border-radius: 4px; background: #3d522c; color: var(--green); font-family: var(--font-mono); font-size: 11px; letter-spacing: .08em; }
