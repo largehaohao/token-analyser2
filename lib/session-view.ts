@@ -399,6 +399,12 @@ export function confidenceLabel(confidence: 'high' | 'medium' | 'low'): string {
   return '低';
 }
 
+export function sessionCompletenessCaption(completeness: AnalysisSession['completeness']): string | undefined {
+  if (completeness === 'complete') return undefined;
+  if (completeness === 'partial') return '部分数据';
+  return '数据不完整';
+}
+
 export function sessionRoleLabel(
   session: Pick<AnalysisSession, 'parentSessionId'>,
   depth: number,
