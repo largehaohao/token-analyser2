@@ -33,8 +33,19 @@ import {
   shouldHandleEscape,
   tokenComposition,
   trendChartMode,
+  analysisCompletenessLabel,
+  anomalyCostView,
+  collectorConnectionLabel,
+  dataFreshness,
+  dataFreshnessLabel,
+  formatGrowthDisplay,
+  LIVE_DATA_MS,
+  GROWTH_WINDOW_MS,
+  optimizableCallIds,
+  rootsMatchingQuery,
+  sessionQueryMatches,
 } from '../lib/session-view';
-import { buildAnalysis, createDemoAnalysis, formatExactTokenCount, formatTokenCount, parseJsonl, usageTokenCount, type AnalysisEvent, type CostSummary } from '../lib/analysis';
+import { buildAnalysis, createDemoAnalysis, formatExactTokenCount, formatTokenCount, parseJsonl, usageTokenCount, type AnalysisEvent, type CostSummary, type RateSnapshot } from '../lib/analysis';
 
 test('session labels use directory basename and explicit title with honest fallbacks', () => {
   assert.equal(sessionDisplayName({ id: 'abc', title: '优化 UI', cwd: '/projects/token-analyser2/' }), 'token-analyser2 - 优化 UI');
@@ -507,5 +518,185 @@ test('escape closing ignores typing targets and trend unknown-only ranges stay e
   assert.equal(trendChartMode([]), 'empty');
   assert.equal(trendChartMode([{ known: false }, { known: false }]), 'unknown-only');
   assert.equal(trendChartMode([{ known: true }, { known: false }]), 'chart');
+});
+
+const viewRate: RateSnapshot = {
+  id: 'view-rate',
+  provider: 'codex',
+  modelPattern: '*',
+  inputUsdPerMillion: 1,
+  cachedInputUsdPerMillion: 0.1,
+  outputUsdPerMillion: 5,
+  source: 'test',
+  checkedDate: '2026-08-28',
+  applicability: 'synthetic',
+  kind: 'custom',
+};
+
+const viewIso = (seconds: number) => new Date(Date.UTC(2026, 7, 28, 12, 0, seconds)).toISOString();
+
+function viewEvent(overrides: Partial<AnalysisEvent>): AnalysisEvent {
+  return {
+    id: 'event',
+    provider: 'codex',
+    sourceFile: 'view.jsonl',
+    sourceLine: 1,
+    timestamp: viewIso(0),
+    kind: 'model',
+    sessionId: 'main',
+    actorId: 'main',
+    ...overrides,
+  };
+}
+
+test('anomaly cards expose candidate cost separately from associated call cost', () => {
+  const calls = [0, 1, 2].map((seconds) => viewEvent({
+    id: 'call-' + String(seconds),
+    sourceLine: seconds + 1,
+    timestamp: viewIso(seconds),
+    usage: { inputTokens: 1_000_000, outputTokens: 0 },
+  }));
+  const reads = calls.map((call, index) => viewEvent({
+    id: 'read-' + call.id,
+    kind: 'tool',
+    sourceLine: 10 + index,
+    timestamp: call.timestamp,
+    callId: call.id,
+    toolName: 'Read',
+    behavior: 'read',
+    filePath: 'src/app.ts',
+    fileRange: '1-3',
+    contentHash: 'same',
+    usage: undefined,
+  }));
+  const analysis = buildAnalysis([...calls, ...reads], [viewRate]);
+  const anomaly = analysis.anomalies.find((item) => item.type === 'reread')!;
+  const view = anomalyCostView(anomaly, analysis, 'usd');
+  assert.equal(view.reason, 'candidate');
+  assert.equal(view.countsTowardCandidate, true);
+  assert.equal(view.candidateDisplay.value, '$2.00');
+  assert.equal(view.associatedDisplay.value, '$3.00');
+  assert.equal(analysis.candidateCost.usd, 2);
+  assert.equal(view.candidateDisplay.value.includes(view.associatedDisplay.value), false);
+});
+
+test('mixed and low-confidence anomalies never present associated cost as optimizable', () => {
+  const mixedCall = viewEvent({ id: 'mixed-call', behavior: 'mixed', usage: { inputTokens: 1_000_000, outputTokens: 0 } });
+  const mixedReads = [0, 1, 2].map((seconds, index) => viewEvent({
+    id: 'mixed-read-' + String(index),
+    kind: 'tool',
+    sourceLine: index + 2,
+    timestamp: viewIso(seconds),
+    callId: mixedCall.id,
+    toolName: 'Read',
+    behavior: 'read',
+    filePath: 'src/app.ts',
+    fileRange: '1-3',
+    contentHash: 'same',
+    usage: undefined,
+  }));
+  const mixedAnalysis = buildAnalysis([mixedCall, ...mixedReads], [viewRate]);
+  const mixedView = anomalyCostView(mixedAnalysis.anomalies[0]!, mixedAnalysis, 'usd');
+  assert.equal(mixedView.reason, 'mixed');
+  assert.equal(mixedView.candidateDisplay.value, '—');
+  assert.equal(mixedView.associatedDisplay.value, '$1.00');
+  assert.match(mixedView.note, /无法精确拆分/);
+
+  const lowEvents = [
+    viewEvent({ id: 'low-call', usage: { inputTokens: 1_000_000, outputTokens: 0 } }),
+    ...[0, 1, 2].map((seconds, index) => viewEvent({
+      id: 'low-read-' + String(index),
+      kind: 'tool',
+      timestamp: viewIso(seconds),
+      callId: 'low-call',
+      toolName: 'Read',
+      filePath: 'src/app.ts',
+      fileRange: '1-3',
+      usage: undefined,
+    })),
+  ];
+  const lowAnalysis = buildAnalysis(lowEvents, [viewRate]);
+  const lowView = anomalyCostView(lowAnalysis.anomalies[0]!, lowAnalysis, 'usd');
+  assert.equal(lowAnalysis.anomalies[0]?.confidence, 'low');
+  assert.equal(lowView.reason, 'low-confidence');
+  assert.equal(lowView.candidateDisplay.value, '—');
+  assert.equal(optimizableCallIds(mixedAnalysis.anomalies).size, 0);
+  assert.equal(optimizableCallIds(lowAnalysis.anomalies).size, 0);
+  assert.equal(optimizableCallIds(buildAnalysis([
+    ...[0, 1, 2].flatMap((seconds) => [
+      viewEvent({ id: 'ok-' + String(seconds), timestamp: viewIso(seconds), usage: { inputTokens: 1_000_000, outputTokens: 0 } }),
+      viewEvent({
+        id: 'ok-read-' + String(seconds),
+        kind: 'tool',
+        timestamp: viewIso(seconds),
+        callId: 'ok-' + String(seconds),
+        toolName: 'Read',
+        filePath: 'a.ts',
+        fileRange: '1-1',
+        contentHash: 'x',
+        usage: undefined,
+      }),
+    ]),
+  ], [viewRate]).anomalies).size, 2);
+});
+
+test('necessary marks drop a pattern from candidate display without changing associated cost', () => {
+  const analysis = buildAnalysis([0, 1, 2].flatMap((seconds) => [
+    viewEvent({ id: 'n-' + String(seconds), timestamp: viewIso(seconds), usage: { inputTokens: 1_000_000, outputTokens: 0 } }),
+    viewEvent({
+      id: 'n-read-' + String(seconds),
+      kind: 'tool',
+      timestamp: viewIso(seconds),
+      callId: 'n-' + String(seconds),
+      toolName: 'Read',
+      filePath: 'a.ts',
+      fileRange: '1-1',
+      contentHash: 'x',
+      usage: undefined,
+    }),
+  ]), [viewRate], { necessaryCallIds: new Set(['n-1', 'n-2']) });
+  const view = anomalyCostView(analysis.anomalies[0]!, analysis, 'usd');
+  assert.equal(view.reason, 'necessary');
+  assert.equal(view.candidateDisplay.value, '—');
+  assert.equal(view.associatedDisplay.value, '$3.00');
+  assert.equal(optimizableCallIds(analysis.anomalies, analysis.necessaryCallIds).size, 0);
+});
+
+test('growth display keeps the rate string honest and labels current vs historical windows separately', () => {
+  const ended = formatGrowthDisplay(1000, false);
+  assert.equal(ended.value.includes('当时'), false);
+  assert.equal(ended.badge, '当时');
+  assert.match(ended.caption, /当时窗口/);
+  const current = formatGrowthDisplay(1000, true);
+  assert.equal(current.badge, '当前');
+  assert.match(current.caption, /^当前窗口/);
+  assert.equal(formatGrowthDisplay(undefined, true).badge, undefined);
+});
+
+test('collector connection and log silence are independent labels', () => {
+  const now = Date.parse('2026-08-28T12:00:00.000Z');
+  assert.equal(collectorConnectionLabel('collecting'), '采集已连接');
+  assert.equal(collectorConnectionLabel('unreachable'), '采集未连接');
+  assert.equal(dataFreshness(new Date(now).toISOString(), now), 'live');
+  assert.equal(dataFreshness(new Date(now - LIVE_DATA_MS - 1).toISOString(), now), 'quiet');
+  assert.equal(dataFreshness(new Date(now - GROWTH_WINDOW_MS - 1).toISOString(), now), 'stale');
+  assert.equal(dataFreshness(undefined, now), 'unknown');
+  assert.equal(dataFreshness('not-a-date', now), 'unknown');
+  assert.equal(dataFreshnessLabel('quiet', true), '日志静默');
+  assert.equal(dataFreshnessLabel('quiet', false), '近期有记录');
+  assert.equal(analysisCompletenessLabel('complete'), '数据完整');
+  assert.equal(analysisCompletenessLabel('partial'), '部分数据');
+});
+
+test('session search keeps ancestor roots so the tree still has context', () => {
+  const parent = { id: 'root', provider: 'codex' as const, parentSessionId: undefined, title: '网关', cwd: '/svc/api' };
+  const child = { id: 'child', provider: 'codex' as const, parentSessionId: 'root', title: '鉴权子任务', cwd: '/svc/api' };
+  const other = { id: 'other', provider: 'claude' as const, parentSessionId: undefined, title: '文档', cwd: '/docs' };
+  const sessions = [parent, child, other];
+  assert.equal(sessionQueryMatches(child, '鉴权'), true);
+  assert.deepEqual(rootsMatchingQuery(sessions, '鉴权').map((session) => session.id), ['root']);
+  assert.deepEqual(rootsMatchingQuery(sessions, 'claude').map((session) => session.id), ['other']);
+  assert.equal(rootsMatchingQuery(sessions, '').length, 2);
+  assert.equal(rootsMatchingQuery(sessions, '不存在').length, 0);
 });
 

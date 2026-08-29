@@ -1,9 +1,11 @@
 import {
+  costForCalls,
   formatExactTokenCount,
   formatMoney,
   formatTokenCount,
   usageTokenCount,
   type AnalysisEvent,
+  type AnalysisResult,
   type AnalysisSession,
   type Anomaly,
   type Behavior,
@@ -551,4 +553,150 @@ export function shouldHandleEscape(target: unknown): boolean {
 export function trendChartMode(items: readonly { known: boolean }[]): 'empty' | 'unknown-only' | 'chart' {
   if (!items.length) return 'empty';
   return items.some((item) => item.known) ? 'chart' : 'unknown-only';
+}
+
+export const LIVE_DATA_MS = 5_000;
+
+export type CollectorConnection = 'idle' | 'loading' | 'collecting' | 'stopped' | 'error' | 'unreachable';
+export type DataFreshness = 'live' | 'quiet' | 'stale' | 'unknown';
+
+export function collectorConnectionLabel(status: CollectorConnection): string {
+  if (status === 'collecting') return '采集已连接';
+  if (status === 'loading') return '正在读取';
+  if (status === 'stopped') return '采集已停止';
+  if (status === 'error') return '采集需检查';
+  if (status === 'unreachable') return '采集未连接';
+  return '未开始采集';
+}
+
+/** Freshness of source records, independent of collector connection. */
+export function dataFreshness(lastDataAt: string | undefined, now = Date.now()): DataFreshness {
+  if (!lastDataAt) return 'unknown';
+  const time = Date.parse(lastDataAt);
+  if (!Number.isFinite(time) || time > now + 1_000) return 'unknown';
+  const age = Math.max(0, now - time);
+  if (age <= LIVE_DATA_MS) return 'live';
+  if (age <= GROWTH_WINDOW_MS) return 'quiet';
+  return 'stale';
+}
+
+export function dataFreshnessLabel(kind: DataFreshness, collecting = false): string {
+  if (kind === 'live') return '刚有新记录';
+  if (kind === 'quiet') return collecting ? '日志静默' : '近期有记录';
+  if (kind === 'stale') return collecting ? '日志静默 · 来源较久未更新' : '来源较久未更新';
+  return '尚无数据时间';
+}
+
+export function analysisCompletenessLabel(completeness: AnalysisSession['completeness']): string {
+  if (completeness === 'complete') return '数据完整';
+  if (completeness === 'partial') return '部分数据';
+  return '数据未知';
+}
+
+export function formatGrowthDisplay(
+  rate: number | undefined,
+  active: boolean,
+): { value: string; badge?: '当前' | '当时'; caption: string } {
+  const value = formatGrowthRate(rate);
+  const caption = formatGrowthCaption(rate);
+  if (rate === undefined || !Number.isFinite(rate)) return { value, caption };
+  return {
+    value,
+    badge: active ? '当前' : '当时',
+    caption: (active ? '当前窗口 · ' : '已结束会话的当时窗口 · ') + caption,
+  };
+}
+
+/** Call IDs that actually enter the 疑似可优化费用 set. Mixed, low-confidence, baseline, and necessary IDs stay out. */
+export function optimizableCallIds(
+  anomalies: readonly Pick<Anomaly, 'mixed' | 'confidence' | 'candidateCallIds'>[],
+  necessaryCallIds: ReadonlySet<string> = new Set(),
+): Set<string> {
+  const ids = new Set<string>();
+  for (const anomaly of anomalies) {
+    if (anomaly.mixed || anomaly.confidence !== 'high') continue;
+    for (const id of anomaly.candidateCallIds) {
+      if (!necessaryCallIds.has(id)) ids.add(id);
+    }
+  }
+  return ids;
+}
+
+const EXCLUDED_COST = { value: '—', note: '', tone: 'unknown' as const };
+
+export function anomalyCostView(
+  anomaly: Pick<Anomaly, 'mixed' | 'confidence' | 'candidateCallIds' | 'callIds' | 'associatedCost'>,
+  analysis: Pick<AnalysisResult, 'calls' | 'rates' | 'necessaryCallIds'>,
+  currency: 'usd' | 'credits',
+): {
+  countsTowardCandidate: boolean;
+  reason: 'candidate' | 'mixed' | 'low-confidence' | 'necessary';
+  note: string;
+  candidateDisplay: ReturnType<typeof displayCost>;
+  associatedDisplay: ReturnType<typeof displayCost>;
+} {
+  const associatedCalls = analysis.calls.filter((call) => anomaly.callIds.includes(call.id));
+  const associated = anomaly.associatedCost ?? costForCalls(associatedCalls, analysis.rates);
+  const associatedDisplay = displayCost(associated, currency);
+  const remaining = anomaly.candidateCallIds.filter((id) => !analysis.necessaryCallIds.has(id));
+  const markedNecessary =
+    anomaly.candidateCallIds.length > 0 && remaining.length === 0;
+  if (anomaly.mixed) {
+    return {
+      countsTowardCandidate: false,
+      reason: 'mixed',
+      note: '关联调用费用，无法精确拆分；不计入疑似可优化汇总',
+      candidateDisplay: { ...EXCLUDED_COST, note: '混合调用不计入疑似可优化汇总' },
+      associatedDisplay,
+    };
+  }
+  if (anomaly.confidence !== 'high') {
+    return {
+      countsTowardCandidate: false,
+      reason: 'low-confidence',
+      note: '证据不完整，金额不计入疑似可优化汇总',
+      candidateDisplay: { ...EXCLUDED_COST, note: '低置信度不计入疑似可优化汇总' },
+      associatedDisplay,
+    };
+  }
+  if (markedNecessary) {
+    return {
+      countsTowardCandidate: false,
+      reason: 'necessary',
+      note: '已标记必要，不计入疑似可优化汇总',
+      candidateDisplay: { ...EXCLUDED_COST, note: '已标记必要，不计入疑似可优化汇总' },
+      associatedDisplay,
+    };
+  }
+  const candidateCalls = analysis.calls.filter((call) => remaining.includes(call.id));
+  return {
+    countsTowardCandidate: true,
+    reason: 'candidate',
+    note: '仅后续纯异常调用 · 基线未计入',
+    candidateDisplay: displayCost(costForCalls(candidateCalls, analysis.rates), currency),
+    associatedDisplay,
+  };
+}
+
+export function sessionQueryMatches(
+  session: Pick<AnalysisSession, 'id' | 'title' | 'cwd' | 'provider'>,
+  query: string,
+): boolean {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return true;
+  return [session.id, session.title, session.cwd, session.provider, sessionDisplayName(session)]
+    .some((value) => value?.toLowerCase().includes(needle));
+}
+
+/** Keep a root if any node in its tree matches, so htop-style expand still has context. */
+export function rootsMatchingQuery<T extends Pick<AnalysisSession, 'id' | 'title' | 'cwd' | 'provider' | 'parentSessionId'>>(
+  sessions: readonly T[],
+  query: string,
+  forest?: SessionForest<T>,
+): T[] {
+  const tree = forest ?? sessionForest(sessions);
+  if (!query.trim()) return [...tree.roots];
+  return tree.roots.filter((root) =>
+    sessionsUnderRoots(sessions, [root], tree).some((session) => sessionQueryMatches(session, query)),
+  );
 }
