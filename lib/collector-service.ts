@@ -273,10 +273,28 @@ export function createCollector(fs: CollectorFs, rates: RateSnapshot[] = default
     if (changed) { analysisDirty = true; revision += 1; }
   }
 
+  function removeMissingFiles(files: string[]): void {
+    if (!root) return;
+    const currentFiles = new Set(files);
+    let changed = false;
+    for (const fullPath of cursors.keys()) {
+      if (currentFiles.has(fullPath)) continue;
+      const relative = relativeTo(root, fullPath);
+      cursors.delete(fullPath);
+      changed = eventsByFile.delete(relative) || changed;
+      changed = errorsByFile.delete(relative) || changed;
+    }
+    if (changed) {
+      analysisDirty = true;
+      revision += 1;
+    }
+  }
+
   async function poll(): Promise<CollectorSnapshot> {
     if (status !== 'collecting' || !root) return statusSnapshot();
     try {
       const files = await walk(root);
+      removeMissingFiles(files);
       for (const file of files) await ingestFile(file);
       if (fs.sessionMetadata) {
         const next = await fs.sessionMetadata(root).catch(() => undefined);

@@ -8,6 +8,7 @@ import { createNodeCollectorFs } from '../lib/node-fs';
 import { contextInventoryIndex, contextSessionKey } from '../lib/context-inventory';
 import { consumeJsonlChunk, isSessionLogFile } from '../lib/jsonl-cursor';
 import { createCollector, type CollectorFs } from '../lib/collector-service';
+import { buildAnalysis, parseJsonl } from '../lib/analysis';
 
 test('accepts session log extensions and ignores other files', () => {
   assert.equal(isSessionLogFile('session.jsonl'), true);
@@ -27,7 +28,10 @@ test('holds back an incomplete trailing line until the newline arrives', () => {
   assert.equal(second.pending, '');
 });
 
-function memoryFs(files: Record<string, string>): CollectorFs & { write(path: string, content: string): void } {
+function memoryFs(files: Record<string, string>): CollectorFs & {
+  write(path: string, content: string): void;
+  remove(path: string): void;
+} {
   const store = { ...files };
   return {
     async realpath(path) {
@@ -66,6 +70,9 @@ function memoryFs(files: Record<string, string>): CollectorFs & { write(path: st
     },
     write(path: string, content: string) {
       store[path] = content;
+    },
+    remove(path: string) {
+      delete store[path];
     },
   };
 }
@@ -350,6 +357,74 @@ test('incremental collection removes a Codex child replay when its boundary arri
   assert.equal(raw.events.filter((event) => event.replayed).length, 1);
   assert.equal(analysis.calls.length, 1);
   assert.equal(analysis.usage.totalTokens, 22);
+});
+
+test('incremental Codex analysis matches a full import across line-by-line polls', async () => {
+  const rows = [
+    { type: 'session_meta', payload: { id: 'parity-child', parent_session_id: 'parity-parent', cwd: '/projects/parity', title: 'Parity child' } },
+    { type: 'event_msg', payload: { type: 'thread_settings_applied', thread_settings: { service_tier: 'default' } } },
+    { type: 'user', call_id: 'request-1', session_id: 'parity-child', text: 'first task' },
+    { type: 'turn_context', payload: { model: 'gpt-5.6-sol' } },
+    { timestamp: '2026-08-30T08:00:00Z', type: 'event_msg', payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 100, output_tokens: 10 }, total_token_usage: { input_tokens: 100, output_tokens: 10 } } } },
+    { timestamp: '2026-08-30T08:01:00Z', type: 'event_msg', payload: { type: 'task_started' } },
+    { timestamp: '2026-08-30T08:02:00Z', type: 'event_msg', payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 20, output_tokens: 2 }, total_token_usage: { input_tokens: 120, output_tokens: 12 } } } },
+    { type: 'user', call_id: 'request-2', session_id: 'parity-child', text: 'second task' },
+    { timestamp: '2026-08-30T08:03:00Z', type: 'event_msg', payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 30, output_tokens: 3 }, total_token_usage: { input_tokens: 150, output_tokens: 15 } } } },
+  ];
+  const lines = rows.map((row) => JSON.stringify(row) + '\n');
+  const log = '/logs/session.jsonl';
+  const fs = memoryFs({ [log]: '' });
+  const collector = createCollector(fs);
+  await collector.start('/logs');
+  let content = '';
+  for (const line of lines) {
+    content += line;
+    fs.write(log, content);
+    await collector.poll();
+  }
+
+  const live = collector.snapshot().analysis!;
+  const imported = buildAnalysis(parseJsonl(content, { sourceFile: 'session.jsonl' }).events);
+  const callView = (analysis: typeof live) => analysis.calls.map((call) => ({
+    id: call.id,
+    provider: call.provider,
+    sessionId: call.sessionId,
+    parentSessionId: call.parentSessionId,
+    userRequestId: call.userRequestId,
+    sessionTitle: call.sessionTitle,
+    cwd: call.cwd,
+    model: call.model,
+    serviceTier: call.serviceTier,
+    usage: call.usage,
+  }));
+
+  assert.deepEqual(callView(live), callView(imported));
+  assert.deepEqual(live.usage, imported.usage);
+  assert.deepEqual(live.cost, imported.cost);
+  assert.ok(Math.abs((live.cost.credits ?? 0) - 0.0075) < 1e-12);
+  assert.equal(live.cost.unknownCalls, 0);
+});
+
+test('removes a stale source when a session log moves to the archive', async () => {
+  const active = '/logs/sessions/session.jsonl';
+  const archived = '/logs/archived_sessions/session.jsonl';
+  const content = [
+    { type: 'session_meta', payload: { id: 'archived-session' } },
+    { type: 'assistant', session_id: 'archived-session', message: { id: 'only-call', model: 'gpt-5.6-sol', usage: { input_tokens: 40, output_tokens: 4 } } },
+  ].map((row) => JSON.stringify(row)).join('\n') + '\n';
+  const fs = memoryFs({ [active]: content });
+  const collector = createCollector(fs);
+  await collector.start('/logs');
+  assert.equal(collector.snapshot().analysis?.calls.length, 1);
+
+  fs.remove(active);
+  fs.write(archived, content);
+  await collector.poll();
+
+  const analysis = collector.snapshot().analysis!;
+  assert.equal(analysis.calls.length, 1);
+  assert.equal(analysis.usage.totalTokens, 44);
+  assert.equal(collector.rawSnapshot().events.every((event) => event.sourceFile.startsWith('archived_sessions/')), true);
 });
 
 test('scans Codex root sessions without ingesting unrelated JSON files', async () => {

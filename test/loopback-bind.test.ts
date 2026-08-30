@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createServer, type RequestListener } from 'node:http';
+import { createServer, get, type RequestListener } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import test from 'node:test';
 import { attachExtraLoopback, extraLoopbackHost } from '../lib/loopback-bind';
@@ -30,12 +30,18 @@ test('attachExtraLoopback serves the other loopback family on the same port', as
   try {
     assert.ok(extra);
     const port = (primary.address() as AddressInfo).port;
-    const ipv4 = await fetch('http://127.0.0.1:' + String(port));
-    const ipv6 = await fetch('http://[::1]:' + String(port));
-    assert.equal(ipv4.status, 200);
-    assert.equal(await ipv4.text(), 'loopback');
-    assert.equal(ipv6.status, 200);
-    assert.equal(await ipv6.text(), 'loopback');
+    const request = (url: string) => new Promise<{ status: number | undefined; body: string }>((resolve, reject) => {
+      get(url, (response) => {
+        let body = '';
+        response.setEncoding('utf8');
+        response.on('data', (chunk: string) => { body += chunk; });
+        response.on('end', () => resolve({ status: response.statusCode, body }));
+      }).once('error', reject);
+    });
+    const ipv4 = await request('http://127.0.0.1:' + String(port));
+    const ipv6 = await request('http://[::1]:' + String(port));
+    assert.deepEqual(ipv4, { status: 200, body: 'loopback' });
+    assert.deepEqual(ipv6, { status: 200, body: 'loopback' });
   } finally {
     extra?.close();
     await new Promise<void>((resolve) => primary.close(() => resolve()));
