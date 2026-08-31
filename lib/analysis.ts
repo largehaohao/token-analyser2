@@ -89,6 +89,9 @@ export interface ParsedJsonl {
 export interface ParseContinuationState {
   seenUsageSessions: Set<string>;
   sessionParents: Map<string, string>;
+  sessionTitles: Map<string, string>;
+  sessionDirectories: Map<string, string>;
+  sessionModels: Map<string, string>;
   sessionServiceTiers: Map<string, 'standard' | 'fast' | 'unknown'>;
   tokenTotals: Map<string, Usage>;
   replayBoundarySessions: Set<string>;
@@ -100,6 +103,9 @@ export function createParseContinuationState(): ParseContinuationState {
   return {
     seenUsageSessions: new Set(),
     sessionParents: new Map(),
+    sessionTitles: new Map(),
+    sessionDirectories: new Map(),
+    sessionModels: new Map(),
     sessionServiceTiers: new Map(),
     tokenTotals: new Map(),
     replayBoundarySessions: new Set(),
@@ -112,6 +118,9 @@ export function cloneParseContinuationState(state: ParseContinuationState): Pars
   return {
     seenUsageSessions: new Set(state.seenUsageSessions),
     sessionParents: new Map(state.sessionParents),
+    sessionTitles: new Map(state.sessionTitles),
+    sessionDirectories: new Map(state.sessionDirectories),
+    sessionModels: new Map(state.sessionModels),
     sessionServiceTiers: new Map(state.sessionServiceTiers),
     tokenTotals: new Map([...state.tokenTotals].map(([key, usage]) => [key, { ...usage }])),
     replayBoundarySessions: new Set(state.replayBoundarySessions),
@@ -979,12 +988,12 @@ export function parseJsonl(text: string, options: ParseOptions): ParsedJsonl {
   const pendingOutputs = options.pendingOutputs ?? new Map<string, string>();
   const priorToolIds = new Set(toolEvents.keys());
   let updatedExisting = false;
-  const sessionTitles = new Map<string, string>();
-  const sessionDirectories = new Map<string, string>();
+  const sessionTitles = options.continuation?.sessionTitles ?? new Map<string, string>();
+  const sessionDirectories = options.continuation?.sessionDirectories ?? new Map<string, string>();
   if (options.sessionId && options.cwd) sessionDirectories.set(options.sessionId, options.cwd);
   if (options.sessionId && options.sessionTitle) sessionTitles.set(options.sessionId, options.sessionTitle);
   const sessionParents = options.continuation?.sessionParents ?? new Map<string, string>();
-  const sessionModels = new Map<string, string>();
+  const sessionModels = options.continuation?.sessionModels ?? new Map<string, string>();
   const sessionServiceTiers = options.continuation?.sessionServiceTiers ?? new Map<string, 'standard' | 'fast' | 'unknown'>();
   const tokenTotals = options.continuation?.tokenTotals ?? new Map<string, Usage>();
   const replayBoundarySessions = options.continuation?.replayBoundarySessions ?? new Set<string>();
